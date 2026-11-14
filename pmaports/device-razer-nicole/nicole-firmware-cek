@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""nicole-firmware-cek: copy the Razer Edge firmware from the phone's own Android
+partitions into the Linux root, read-only.
+
+The Razer/Qualcomm firmware cannot be shipped in a package. Every Razer Edge carries it
+in its Android partitions, so it is copied from there on the device itself:
+
+  modem_<slot> (FAT)   image/adsp.mdt+bNN, slpi.mdt+bNN -> merged .mbn
+                       image/amss.bin, m3.bin, regdb.bin, bdwlan.elf (Wi-Fi, WCN6851 hw1.1)
+  dsp_<slot> (ext4)    /sdsp                             (hexagonrpcd, sensors)
+  super -> vendor_<slot> (ext4, dynamic partition)
+                       /firmware/a660_zap.elf, vpu20_4v.mbn, aw882xx_acf.bin
+                       /etc/sensors/config, sns_reg_config
+
+Safety: every source block device is first marked read-only in the kernel
+(blockdev --setro), FAT is mounted ro, vendor is mapped with a --readonly dm-linear
+table and read with debugfs (read-only unless -w). Nothing is written to the UFS.
+Files are staged in a temporary directory and only installed after all checks pass.
+
+Usage: nicole-firmware-cek [--slot a|b] [--hedef DIR] [--kuru]
+  --slot   Android slot to read (default b: the slot stock Android runs from)
+  --hedef  root to install into (default /); use a scratch dir to compare
+  --kuru   extract and verify only, install nothing
+"""
+import argparse
+import hashlib
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+BYNAME = "/dev/disk/by-partlabel"
+SECTOR = 512
+FW = "lib/firmware/qcom/sm8350/razer/nicole"
+WIFI = "lib/firmware/ath11k/WCN6855/hw1.1"
+HEXA = "usr/share/qcom/sm8350/razer/nicole"
+DM_NAME = "nicole-fwcek-vendor"
+
+
+def run(*cmd, check=True, **kw):
+    return subprocess.run(cmd, check=check, text=True, capture_output=True, **kw)
+
+
+def blockdev(label):
+    p = os.path.realpath(os.path.join(BYNAME, label))
+    if not os.path.exists(p) or not os.path.isabs(p) or not p.startswith("/dev/"):
+        sys.exit(f"bölüm yok: {label}")
+    run("blockdev", "--setro", p)
+    if run("blockdev", "--getro", p).stdout.strip() != "1":
+        sys.exit(f"salt okunur yapılamadı: {p}")
+    return p
+
+
+# --- Android dynamic partitions (system/core/fs_mgr/liblp) ---------------------------
+def lp_extents(super_dev, name):
+    with open(super_dev, "rb") as f:
+        f.seek(4096)
+        magic, _ = struct.unpack("<II", f.read(8))
+        if magic != 0x616C4467:
+            sys.exit("super: LP geometri imzası yok")
+        f.read(32)
+        max_size, slot_count, _ = struct.unpack("<III", f.read(12))
+        for slot in range(slot_count):
+            base = 3 * 4096 + slot * max_size
+            f.seek(base)
+            hdr = f.read(256)
+            magic, _maj, _min, hdr_size = struct.unpack_from("<IHHI", hdr, 0)
+            if magic != 0x414C5030:
+                continue
+            descs = struct.unpack_from("<12I", hdr, 12 + 32 + 4 + 32)
+            part_d, ext_d = descs[0:3], descs[3:6]
+            f.seek(base + hdr_size + ext_d[0])
+            exts = [struct.unpack_from("<QIQI", f.read(ext_d[2]))[:3] for _ in range(ext_d[1])]
+            f.seek(base + hdr_size + part_d[0])
+            for _ in range(part_d[1]):
+                e = f.read(part_d[2])
+                if e[:36].split(b"\0")[0].decode() == name:
+                    _attr, first, num, _grp = struct.unpack_from("<IIII", e, 36)
+                    if num:
+                        return exts[first:first + num]
+    sys.exit(f"super: {name} bulunamadı ya da boş")
+
+
+def dm_map(super_dev, exts):
+    table, off = [], 0
+    for num, ttype, start in exts:
+        if ttype != 0:
+            sys.exit("super: doğrusal olmayan extent (beklenmiyor)")
+        table.append(f"{off} {num} linear {super_dev} {start}")
+        off += num
+    run("dmsetup", "create", "--readonly", DM_NAME, input="\n".join(table) + "\n")
+    run("udevadm", "settle", check=False)
+    return f"/dev/mapper/{DM_NAME}"
+
+
+def dm_unmap():
+    for _ in range(10):
+        if run("dmsetup", "remove", DM_NAME, check=False).returncode == 0:
+            return
+        run("udevadm", "settle", check=False)
+        time.sleep(0.5)
+    print(f"uyarı: {DM_NAME} kaldırılamadı", file=sys.stderr)
+
+
+def debugfs(dev, cmd):
+    r = run("debugfs", "-R", cmd, dev, check=False)
+    if r.returncode != 0 or "File not found" in r.stderr:
+        sys.exit(f"debugfs '{cmd}': {r.stderr.strip()}")
+
+
+# --- split firmware (.mdt + .bNN) -> single .mbn, same result as pil-squasher --------
+def mdt_merge(mdt, out):
+    data = open(mdt, "rb").read()
+    if data[:4] != b"\x7fELF" or data[4] != 1:
+        sys.exit(f"{mdt}: 32 bit ELF değil")
+    phoff, = struct.unpack_from("<I", data, 28)
+    phentsize, phnum = struct.unpack_from("<HH", data, 42)
+    img = bytearray()
+    def put(off, b):
+        if len(img) < off + len(b):
+            img.extend(b"\0" * (off + len(b) - len(img)))
+        img[off:off + len(b)] = b
+    put(0, data[: phoff + phentsize * phnum])
+    base = mdt[:-4]
+    for i in range(phnum):
+        _t, off, _va, _pa, filesz = struct.unpack_from("<IIIII", data, phoff + i * phentsize)
+        if not filesz:
+            continue
+        seg = f"{base}.b{i:02d}"
+        if os.path.exists(seg):
+            b = open(seg, "rb").read()
+            if len(b) != filesz:
+                sys.exit(f"{seg}: boyut {len(b)} != {filesz}")
+            put(off, b)
+        elif off + filesz <= len(data):
+            put(off, data[off:off + filesz])  # segment stored inside the .mdt (hash)
+        else:
+            sys.exit(f"{seg}: eksik")
+    open(out, "wb").write(img)
+
+
+def check_elf(path):
+    with open(path, "rb") as f:
+        if f.read(4) != b"\x7fELF":
+            sys.exit(f"{path}: ELF değil")
+
+
+def main():
+    a = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    a.add_argument("--slot", choices="ab", default="b")
+    a.add_argument("--hedef", default="/")
+    a.add_argument("--kuru", action="store_true")
+    o = a.parse_args()
+    if os.geteuid() != 0:
+        sys.exit("root gerekli (doas nicole-firmware-cek)")
+
+    modem = blockdev(f"modem_{o.slot}")
+    dsp = blockdev(f"dsp_{o.slot}")
+    sup = blockdev("super")
+
+    tmp = tempfile.mkdtemp(prefix="fwcek-")
+    st = os.path.join(tmp, "kok")
+    mnt = os.path.join(tmp, "modem")
+    os.makedirs(mnt)
+    for d in (FW, WIFI, HEXA + "/dsp", HEXA + "/sensors"):
+        os.makedirs(os.path.join(st, d), exist_ok=True)
+    mapped = mounted = False
+    try:
+        run("mount", "-t", "vfat", "-o", "ro,nosuid,nodev,noexec", modem, mnt)
+        mounted = True
+        img = os.path.join(mnt, "image")
+        for fw in ("adsp", "slpi"):
+            mdt_merge(os.path.join(img, f"{fw}.mdt"), os.path.join(st, FW, f"{fw}.mbn"))
+        for src, dst in (("amss.bin", "amss.bin"), ("m3.bin", "m3.bin"),
+                         ("regdb.bin", "regdb.bin"), ("bdwlan.elf", "board.bin")):
+            shutil.copyfile(os.path.join(img, src), os.path.join(st, WIFI, dst))
+        run("umount", mnt)
+        mounted = False
+
+        debugfs(dsp, f"rdump /sdsp {os.path.join(st, HEXA, 'dsp')}")
+
+        vend = dm_map(sup, lp_extents(sup, f"vendor_{o.slot}"))
+        mapped = True
+        for src, dst in (("/firmware/a660_zap.elf", "a660_zap.mbn"),
+                         ("/firmware/vpu20_4v.mbn", "vpu20_4v.mbn"),
+                         ("/firmware/aw882xx_acf.bin", "aw88261_acf.bin")):
+            debugfs(vend, f"dump {src} {os.path.join(st, FW, dst)}")
+        debugfs(vend, f"rdump /etc/sensors/config {os.path.join(st, HEXA, 'sensors')}")
+        debugfs(vend, f"dump /etc/sensors/sns_reg_config {os.path.join(st, HEXA, 'sensors', 'sns_reg.conf')}")
+        dm_unmap()
+        mapped = False
+
+        # checks before anything is installed
+        for f in ("adsp.mbn", "slpi.mbn", "a660_zap.mbn", "vpu20_4v.mbn"):
+            check_elf(os.path.join(st, FW, f))
+        for f in ("amss.bin", "m3.bin", "board.bin"):
+            check_elf(os.path.join(st, WIFI, f))
+        if open(os.path.join(st, FW, "aw88261_acf.bin"), "rb").read(9)[4:] != b"A2113":
+            print("uyarı: aw88261_acf.bin başlığı beklenenden farklı", file=sys.stderr)
+        if not os.listdir(os.path.join(st, HEXA, "dsp", "sdsp")):
+            sys.exit("dsp/sdsp boş")
+        if not os.path.getsize(os.path.join(st, HEXA, "sensors", "sns_reg.conf")):
+            sys.exit("sns_reg.conf boş")
+
+        files = []
+        for root, _dirs, names in os.walk(st):
+            for n in sorted(names):
+                p = os.path.join(root, n)
+                rel = os.path.relpath(p, st)
+                h = hashlib.sha256(open(p, "rb").read()).hexdigest()
+                files.append((rel, p))
+                if not rel.startswith(HEXA):
+                    print(f"{h[:16]}  {os.path.getsize(p):9d}  /{rel}")
+        print(f"{len(files)} dosya (dsp + sensör ayarları dahil), slot {o.slot}")
+        if o.kuru:
+            print("--kuru: hiçbir şey kurulmadı")
+            return
+        for rel, p in files:
+            d = os.path.join(o.hedef, rel)
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            shutil.copyfile(p, d + ".yeni")
+            os.chmod(d + ".yeni", 0o644)
+            os.replace(d + ".yeni", d)
+        for d in (os.path.join(o.hedef, HEXA),):
+            for root, dirs, _ in os.walk(d):
+                for x in dirs:
+                    os.chmod(os.path.join(root, x), 0o755)
+        print(f"kuruldu: {o.hedef}")
+    finally:
+        if mounted:
+            run("umount", mnt, check=False)
+        if mapped:
+            dm_unmap()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

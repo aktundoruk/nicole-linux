@@ -1,0 +1,3 @@
+# rtc-pm8xxx is a module and the kernel sets the clock to the bare RTC when it registers:
+# run swclock-offset-boot (nicole-saat kur) again once rtc0 is there (6 Kasım).
+ACTION=="add", SUBSYSTEM=="rtc", KERNEL=="rtc0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="swclock-offset-boot.service"

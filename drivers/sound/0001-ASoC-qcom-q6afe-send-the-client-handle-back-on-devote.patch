@@ -1,0 +1,82 @@
+From: Razer Edge port draft
+Subject: [PATCH] ASoC: qcom: q6afe: send the DSP's client handle back on devote
+
+AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST is answered with
+AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST, whose payload is the
+client handle the DSP gave this vote, not a basic result. The driver
+never kept it and sent 0 in every devote, so the DSP rejected each one
+(error 0x1 for opcode 0x100f6) and kept the LPASS core voted. On the
+Razer Edge (SM8350) the ADSP then never power-collapsed while the audio
+stack was loaded, even with every macro and SoundWire runtime-suspended.
+
+Keep the handle per hardware block id (the token of the request) and
+return it to the caller, so the devote carries it. Votes are serialized
+by the clk prepare_lock, so one slot per block is enough. The devote is
+not waited for; its error, if any, is already printed by the callback.
+
+Found on the Razer Edge (1 Kasım 2026): with the fix the ADSP sleeps
+55 to 127 times a minute with the full audio stack loaded, and no
+devote errors appear.
+---
+diff --git a/sound/soc/qcom/qdsp6/q6afe.c b/sound/soc/qcom/qdsp6/q6afe.c
+index f0ff1350e..92893ab0f 100644
+--- a/sound/soc/qcom/qdsp6/q6afe.c
++++ b/sound/soc/qcom/qdsp6/q6afe.c
+@@ -50,6 +50,7 @@
+ #define AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST	0x000100f4
+ #define AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST   0x000100f5
+ #define AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST	0x000100f6
++#define AFE_LPASS_CORE_HW_BLOCK_MAX	8
+ 
+ /* I2S config specific */
+ #define AFE_API_VERSION_I2S_CONFIG	0x1
+@@ -396,6 +397,8 @@ struct q6afe {
+ 	wait_queue_head_t wait;
+ 	struct list_head port_list;
+ 	spinlock_t port_list_lock;
++	/* client handles from AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST, by block id */
++	u32 lpass_hw_handle[AFE_LPASS_CORE_HW_BLOCK_MAX];
+ };
+ 
+ struct afe_port_cmd_device_start {
+@@ -1039,12 +1042,23 @@ static int q6afe_callback(struct apr_device *adev, const struct apr_resp_pkt *da
+ 		default:
+ 			dev_err(afe->dev, "Unknown cmd 0x%x\n",	res->opcode);
+ 			break;
++		case AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST:
++			/* not waited for; an error was printed above */
++			break;
+ 		}
+ 	}
+ 		break;
+ 	case AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST:
++		/*
++		 * The payload is not a basic result but the client handle the DSP
++		 * gave this vote; the devote must send it back, or the DSP rejects
++		 * it and keeps the LPASS core voted (the ADSP then never sleeps).
++		 */
++		if (hdr->token < AFE_LPASS_CORE_HW_BLOCK_MAX &&
++		    data->payload_size >= sizeof(u32))
++			afe->lpass_hw_handle[hdr->token] = *(const u32 *)data->payload;
+ 		afe->result.opcode = hdr->opcode;
+-		afe->result.status = res->status;
++		afe->result.status = 0;
+ 		wake_up(&afe->wait);
+ 		break;
+ 	default:
+@@ -1951,10 +1965,15 @@ int q6afe_vote_lpass_core_hw(struct device *dev, uint32_t hw_block_id,
+ 	strscpy(vote_cfg->client_name, client_name,
+ 			sizeof(vote_cfg->client_name));
+ 
++	if (hw_block_id >= AFE_LPASS_CORE_HW_BLOCK_MAX)
++		return -EINVAL;
++
+ 	ret = afe_apr_send_pkt(afe, pkt, NULL,
+ 			       AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST);
+ 	if (ret)
+ 		dev_err(afe->dev, "AFE failed to vote (%d)\n", hw_block_id);
++	else
++		*client_handle = afe->lpass_hw_handle[hw_block_id];
+ 
+ 	return ret;
+ }

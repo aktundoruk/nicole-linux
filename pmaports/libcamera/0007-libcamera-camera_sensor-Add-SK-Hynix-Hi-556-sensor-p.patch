@@ -1,0 +1,84 @@
+From 668d36eb746c21175ee70e9d2eb332fef856ab89 Mon Sep 17 00:00:00 2001
+From: Doruk Aktun <info@dorukaktun.com>
+Date: Sat, 7 Nov 2026 10:00:00 +0300
+Subject: [PATCH] libcamera: camera_sensor: Add SK Hynix Hi-556 sensor
+ properties and helper
+
+Add the camera sensor properties and camera sensor helper entry for the
+SK Hynix Hi-556, a 5MP sensor with 1.12um pixels used as the front
+camera of the Razer Edge.
+
+The analogue gain register holds (gain - 1) * 16 with a range of 0 to
+240, giving 1x to 16x. Without a helper the simple pipeline treats the
+raw register range as linear and, because its minimum is zero, raises
+the lower gain limit to the middle of the range.
+
+The black level was measured at 64 on dark 10-bit frames. Exposure and
+analogue gain changes were measured to take effect two frames after
+they are written. The test pattern indices follow the hi556 kernel
+driver menu.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ src/ipa/libipa/camera_sensor_helper.cpp       | 13 +++++++++++
+ .../sensor/camera_sensor_properties.cpp       | 23 +++++++++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index bb95700..cba6ae3 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -520,6 +520,19 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("gc08a3", CameraSensorHelperGc08a3)
+ 
++class CameraSensorHelperHi556 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperHi556()
++	{
++		/* Measured: 64 at 10bits. */
++		blackLevel_ = 4096;
++		/* Analogue gain is 1 + register / 16, register range 0 to 240. */
++		gain_ = AnalogueGainLinear{ 1, 16, 0, 16 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("hi556", CameraSensorHelperHi556)
++
+ class CameraSensorHelperHm1246 : public CameraSensorHelper
+ {
+ public:
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+index cbe55bc..7f87875 100644
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -132,6 +132,29 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 				.hblankDelay = 2
+ 			},
+ 		} },
++		{ "hi556", {
++			.unitCellSize = { 1120, 1120 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeSolidColor, 1 },
++				{ controls::draft::TestPatternModeColorBars, 2 },
++				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
++				{ controls::draft::TestPatternModePn9, 4 },
++				/*
++				 * No corresponding test pattern mode for:
++				 * 5: "Gradient Horizontal"
++				 * 6: "Gradient Vertical"
++				 * 7: "Check Board"
++				 * 8: "Slant Pattern"
++				 */
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
+ 		{ "hi846", {
+ 			.unitCellSize = { 1120, 1120 },
+ 			.testPatternModes = {

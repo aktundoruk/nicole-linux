@@ -1,0 +1,54 @@
+# Reference: <https://postmarketos.org/deviceinfo>
+# Please use double quotes only. You can source this file in shell
+# scripts.
+#
+# DRAFT for the Razer Edge Wi-Fi (nicole) mainline port. Values marked
+# TODO(cihaz) can only be confirmed on the device (docs/boot-plani.md).
+
+deviceinfo_format_version="0"
+deviceinfo_name="Razer Edge Wi-Fi"
+deviceinfo_manufacturer="Razer"
+deviceinfo_codename="razer-nicole"
+deviceinfo_year="2023"
+deviceinfo_dtb="qcom/sm8350-razer-nicole"
+deviceinfo_arch="aarch64"
+
+# Device related
+# Handheld game console; "handset" is the closest chassis value.
+deviceinfo_chassis="handset"
+deviceinfo_external_storage="true"
+# TODO: "true" once DRM_MSM + panel work (milestone M2); simpledrm only until then
+deviceinfo_drm="false"
+deviceinfo_screen_width="1080"
+deviceinfo_screen_height="2400"
+# macOS has native CDC-NCM/ECM but no RNDIS driver; NCM is pmOS' default anyway.
+deviceinfo_usb_network_function="ncm.usb0"
+
+# Bootloader related
+deviceinfo_flash_method="fastboot"
+deviceinfo_generate_bootimg="true"
+# Same recipe as sony-pdx215 (SM8350): header v1 + DTB appended to Image.gz,
+# no qcom,msm-id/board-id in the DTB. TODO(cihaz): "2" if boot attempt d2 wins.
+deviceinfo_header_version="1"
+deviceinfo_append_dtb="true"
+deviceinfo_flash_pagesize="4096"
+deviceinfo_flash_offset_base="0x00000000"
+deviceinfo_flash_offset_dtb="0x01f00000"
+deviceinfo_flash_offset_kernel="0x00008000"
+deviceinfo_flash_offset_ramdisk="0x01000000"
+deviceinfo_flash_offset_second="0x00000000"
+deviceinfo_flash_offset_tags="0x00000100"
+
+# Project rules (docs/guvenlik-kurallari.md): images are only RAM-booted ("pmbootstrap flasher boot").
+# Never flash automatically; if a kernel is ever flashed it goes to slot A only
+# (slot layout 2026-10-24: B = stock Android safety net, A = ours)
+# (Seviye 2). The rootfs lives on microSD - "flash_rootfs" must never be used, the
+# bogus partition name makes fastboot refuse instead of wiping userdata.
+deviceinfo_flash_kernel_on_update="false"
+deviceinfo_flash_fastboot_partition_kernel="boot_a"
+deviceinfo_flash_fastboot_partition_dtbo="dtbo_a"
+deviceinfo_flash_fastboot_partition_vendor_boot="vendor_boot_a"
+deviceinfo_flash_fastboot_partition_rootfs="DO_NOT_FLASH_ROOTFS_USE_SDCARD"
+
+# Rootfs on microSD (512-byte sectors). Internal UFS would be 4096.
+deviceinfo_rootfs_image_sector_size="512"

@@ -1,0 +1,10 @@
+[Unit]
+Description=Refill the running slot's boot tries after a healthy boot (nicole-slot)
+ConditionPathExists=/sys/module/ufshcd_core/parameters/write_ranges
+
+[Service]
+Type=oneshot
+# the boot got this far: userspace is up (degraded counts too: one failed unit is no reason
+# to fall back to the rescue slot); kernel panics and initramfs failures never reach here
+ExecCondition=/bin/sh -c 'case "$(systemctl is-system-running)" in running|degraded) exit 0;; esac; exit 1'
+ExecStart=/usr/sbin/nicole-slot tazele

@@ -1,0 +1,45 @@
+From: Razer Edge port draft
+Subject: [PATCH] phy: qcom: qmp-combo: don't reinit for a flip while only DP holds the PHY
+
+On the Razer Edge (SM8350) the USB controller uses only the HS PHY, so the
+QMP combo PHY serves DP alone. Swapping a USB-C monitor for a PC within a
+second, with the second plug flipped, resets the SoC: pmic_glink_altmode's
+worker calls typec_switch_set() first, the orientation differs, and
+qmp_combo_typec_switch_set() forces com_exit()/com_init() while msm DP is
+still tearing down the link of the monitor that just left (HPD low is
+handled asynchronously). Nothing is logged; the RAM is not retained, so the
+reset comes from below Linux (an access with the PHY clocks gone).
+
+When only DP holds the PHY, record the orientation and leave the PHY alone:
+msm DP initialises the PHY on every plug and exits it on unplug, and
+com_init() applies the orientation then. With USB on the PHY the old path
+is kept.
+
+Found on the Razer Edge (1 Kasım 2026): the reset reproduced with the r10
+kernel and with the USB role bridge disabled (dwc3 never left device mode),
+not with a 6 s pause between the two plugs.
+---
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index c39ced168..0ada9e496 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -4785,7 +4785,18 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
+ 	mutex_lock(&qmp->phy_mutex);
+ 	qmp->orientation = orientation;
+ 
+-	if (qmp->init_count) {
++	/*
++	 * With only DP holding the PHY a flip means the sink was replaced and
++	 * DP may still be tearing its link down: a forced com_exit() under it
++	 * takes the PHY away from a running DP controller and the SoC resets
++	 * (seen on SM8350 swapping a monitor for a PC within a second). DP
++	 * brings the PHY up again with phy_init(), which applies the new
++	 * orientation.
++	 */
++	if (qmp->init_count && !qmp->usb_init_count) {
++		dev_dbg(qmp->dev, "orientation %d: DP only, applied on next init\n",
++			orientation);
++	} else if (qmp->init_count) {
+ 		if (qmp->usb_init_count)
+ 			qmp_combo_usb_power_off(qmp->usb_phy);
+ 		qmp_combo_com_exit(qmp, true);

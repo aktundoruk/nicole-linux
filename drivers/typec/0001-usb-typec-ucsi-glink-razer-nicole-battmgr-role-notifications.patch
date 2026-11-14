@@ -1,0 +1,294 @@
+From: Razer Edge port draft
+Subject: [PATCH] usb: typec: ucsi: glink: follow battery manager USB-C role notifications (nicole)
+
+On the Razer Edge (SM8350) the ADSP never sends UC_UCSI_USBC_NOTIFY_IND for a
+plug or an unplug: typec/port0 keeps the state read at probe until ucsi_glink
+is reloaded. What the firmware does send is a battery manager notification,
+0x90 (unplug / sink) and 0x91 (sink partner, we source), which qcom_battmgr
+logs as "unknown notification". Razer's 5.4 battery_charger.c names them
+USB_POWER_SUPPLY_SET_SINK / _SOURCE and drives its OTG GPIO (356) with them;
+its ucsi.c drives the same GPIO when the partner is a UFP.
+
+Register a second pmic_glink client for the battery manager owner and turn
+0x90/0x91 into a connector re-check. The PPM has not flagged the change, so
+the re-check derives CONNECT_CHANGE from the registered partner; when one
+partner replaces another without a disconnect in between (a PC unplugged, a
+hub plugged in: one 0x91) it flags POWER_DIR_CHANGE and PARTNER_CHANGE so the
+roles follow.
+
+An optional "otg-gpios" on the pmic-glink node follows "connected and
+sourcing VBUS": on the Razer Edge it is TLMM 48 (Razer's global 356), the
+enable of the load switch that puts VBUS on the port. An optional
+"ocp-gpios" is that switch's over-current flag (TLMM 79, Razer's ocp_irq.c):
+when it asserts the switch goes off until the next plug.
+
+Found on the Razer Edge (31 Ekim 2026): a hub plugged in after boot stayed
+invisible to typec until "modprobe -r ucsi_glink; modprobe ucsi_glink", and
+got no VBUS until TLMM 48 was driven high.
+
+An optional "phys"/"phy-names = usb2" names the HS PHY. The ADSP's charger
+detection leaves it non-driving about 11 ms after every sink attach (see the
+snps-femto-v2 patch); 500 ms after a sink attach set it to device mode, which
+hands the datapath back to the controller.
+---
+diff --git a/drivers/usb/typec/ucsi/ucsi_glink.c b/drivers/usb/typec/ucsi/ucsi_glink.c
+index 1db0c88d8..ea88baa36 100644
+--- a/drivers/usb/typec/ucsi/ucsi_glink.c
++++ b/drivers/usb/typec/ucsi/ucsi_glink.c
+@@ -11,6 +11,8 @@
+ #include <linux/soc/qcom/pdr.h>
+ #include <linux/usb/typec_mux.h>
+ #include <linux/gpio/consumer.h>
++#include <linux/interrupt.h>
++#include <linux/phy/phy.h>
+ #include <linux/soc/qcom/pmic_glink.h>
+ #include "ucsi.h"
+ 
+@@ -26,6 +28,21 @@
+ #define UC_UCSI_WRITE_BUF_REQ           0x12
+ #define UC_UCSI_USBC_NOTIFY_IND         0x13
+ 
++/*
++ * Razer Edge (nicole): its ADSP firmware reports USB-C power role changes to
++ * the battery manager owner (Razer's battery_charger: USB_POWER_SUPPLY_SET_SINK
++ * / _SOURCE), and no UCSI notification follows, so typec/port0 never sees a
++ * plug or an unplug. The same events drive Razer's OTG GPIO.
++ */
++#define BATTMGR_NOTIFICATION            0x7
++#define BATTMGR_NOTIF_USB_SINK          0x90
++#define BATTMGR_NOTIF_USB_SOURCE        0x91
++
++struct __packed battmgr_notify_msg {
++	struct pmic_glink_hdr   hdr;
++	__le32                  notification;
++};
++
+ struct ucsi_read_buf_req_msg {
+ 	struct pmic_glink_hdr   hdr;
+ };
+@@ -67,6 +84,16 @@ struct pmic_glink_ucsi {
+ 
+ 	struct pmic_glink_client *client;
+ 
++	/* Battery manager notifications standing in for UCSI ones (nicole) */
++	struct pmic_glink_client *battmgr_client;
++	struct work_struct battmgr_work;
++	struct gpio_desc *otg_gpio;
++	struct gpio_desc *ocp_gpio;
++	struct phy *hsphy;
++	struct delayed_work hsphy_work;
++	u32 battmgr_notification;
++	bool recheck;
++
+ 	struct ucsi *ucsi;
+ 	struct completion read_ack;
+ 	struct completion write_ack;
+@@ -207,9 +234,46 @@ static void pmic_glink_ucsi_update_connector(struct ucsi_connector *con)
+ static void pmic_glink_ucsi_connector_status(struct ucsi_connector *con)
+ {
+ 	struct pmic_glink_ucsi *ucsi = ucsi_get_drvdata(con->ucsi);
++	bool connected = UCSI_CONSTAT(con, CONNECTED);
+ 	int orientation;
+ 
+-	if (!UCSI_CONSTAT(con, CONNECTED)) {
++	/*
++	 * A re-check started by a battery manager notification: the PPM has
++	 * not flagged the change, so derive the connect change from the
++	 * partner we have registered. CHANGE is bits 0-15 of the status.
++	 * Swapping one partner for another (a PC for a hub) gives a single
++	 * notification and no disconnect in between: then refresh the power
++	 * and data roles of the partner we keep.
++	 */
++	if (ucsi->recheck && con->num == 1) {
++		u16 change = UCSI_CONSTAT(con, CHANGE);
++
++		ucsi->recheck = false;
++		if (connected != !!con->partner)
++			change |= UCSI_CONSTAT_CONNECT_CHANGE;
++		else if (connected)
++			change |= UCSI_CONSTAT_POWER_DIR_CHANGE | UCSI_CONSTAT_PARTNER_CHANGE;
++		bitmap_write(con->status, change, 0, 16);
++	}
++
++	/*
++	 * nicole: the OTG switch is on while we source VBUS (Razer's ucsi.c),
++	 * and stays off after an over-current until the next plug.
++	 */
++	if (ucsi->otg_gpio && con->num == 1)
++		gpiod_set_value_cansleep(ucsi->otg_gpio,
++					 connected && UCSI_CONSTAT(con, PWR_DIR) == TYPEC_SOURCE &&
++					 !(ucsi->ocp_gpio && gpiod_get_value_cansleep(ucsi->ocp_gpio)));
++
++	/*
++	 * nicole: the ADSP's charger detection leaves the HS PHY non-driving
++	 * a few ms after a sink attach; give the datapath back once it is done.
++	 */
++	if (ucsi->hsphy && con->num == 1 && connected &&
++	    UCSI_CONSTAT(con, PWR_DIR) == TYPEC_SINK)
++		mod_delayed_work(system_dfl_wq, &ucsi->hsphy_work, msecs_to_jiffies(500));
++
++	if (!connected) {
+ 		typec_set_orientation(con->port, TYPEC_ORIENTATION_NONE);
+ 		return;
+ 	}
+@@ -347,6 +411,68 @@ static void pmic_glink_ucsi_callback(const void *data, size_t len, void *priv)
+ 	}
+ }
+ 
++static void pmic_glink_ucsi_battmgr_work(struct work_struct *work)
++{
++	struct pmic_glink_ucsi *ucsi = container_of(work, struct pmic_glink_ucsi, battmgr_work);
++	u32 notification = READ_ONCE(ucsi->battmgr_notification);
++
++	dev_dbg(ucsi->dev, "battery manager notification %#x\n", notification);
++
++	if (ucsi->otg_gpio)
++		gpiod_set_value_cansleep(ucsi->otg_gpio,
++					 notification == BATTMGR_NOTIF_USB_SOURCE);
++
++	if (!ucsi->ucsi_registered)
++		return;
++
++	ucsi->recheck = true;
++	ucsi_connector_change(ucsi->ucsi, 1);
++}
++
++static void pmic_glink_ucsi_hsphy_work(struct work_struct *work)
++{
++	struct pmic_glink_ucsi *ucsi = container_of(to_delayed_work(work),
++						    struct pmic_glink_ucsi, hsphy_work);
++
++	phy_set_mode(ucsi->hsphy, PHY_MODE_USB_DEVICE);
++}
++
++/* nicole: the OTG load switch flags an over-current (Razer's ocp_irq.c turns it off) */
++static irqreturn_t pmic_glink_ucsi_ocp_irq(int irq, void *data)
++{
++	struct pmic_glink_ucsi *ucsi = data;
++
++	if (gpiod_get_value_cansleep(ucsi->ocp_gpio) == 1) {
++		gpiod_set_value_cansleep(ucsi->otg_gpio, 0);
++		dev_warn(ucsi->dev, "USB-C over-current: VBUS switch off\n");
++	}
++
++	return IRQ_HANDLED;
++}
++
++static void pmic_glink_ucsi_battmgr_pdr_notify(void *priv, int state)
++{
++	/* The USBC client's pdr_notify handles (un)registration */
++}
++
++static void pmic_glink_ucsi_battmgr_callback(const void *data, size_t len, void *priv)
++{
++	const struct battmgr_notify_msg *msg = data;
++	struct pmic_glink_ucsi *ucsi = priv;
++	u32 notification;
++
++	if (len != sizeof(*msg) || le32_to_cpu(msg->hdr.opcode) != BATTMGR_NOTIFICATION)
++		return;
++
++	notification = le32_to_cpu(msg->notification);
++	if (notification != BATTMGR_NOTIF_USB_SINK &&
++	    notification != BATTMGR_NOTIF_USB_SOURCE)
++		return;
++
++	WRITE_ONCE(ucsi->battmgr_notification, notification);
++	schedule_work(&ucsi->battmgr_work);
++}
++
+ static void pmic_glink_ucsi_pdr_notify(void *priv, int state)
+ {
+ 	struct pmic_glink_ucsi *ucsi = priv;
+@@ -365,6 +491,8 @@ static void pmic_glink_ucsi_destroy(void *data)
+ 	/* Drain the work items before ucsi_destroy() frees the ucsi instance */
+ 	cancel_work_sync(&ucsi->notify_work);
+ 	cancel_work_sync(&ucsi->register_work);
++	cancel_work_sync(&ucsi->battmgr_work);
++	cancel_delayed_work_sync(&ucsi->hsphy_work);
+ 
+ 	/* Protect to make sure we're not in a middle of a transaction from a glink callback */
+ 	mutex_lock(&ucsi->lock);
+@@ -407,11 +535,19 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
+ 
+ 	INIT_WORK(&ucsi->notify_work, pmic_glink_ucsi_notify);
+ 	INIT_WORK(&ucsi->register_work, pmic_glink_ucsi_register);
++	INIT_WORK(&ucsi->battmgr_work, pmic_glink_ucsi_battmgr_work);
++	INIT_DELAYED_WORK(&ucsi->hsphy_work, pmic_glink_ucsi_hsphy_work);
+ 	init_completion(&ucsi->read_ack);
+ 	init_completion(&ucsi->write_ack);
+ 	spin_lock_init(&ucsi->state_lock);
+ 	mutex_init(&ucsi->lock);
+ 
++	/* "phys": the HS PHY that the ADSP's charger detection borrows on attach */
++	ucsi->hsphy = devm_phy_optional_get(dev, "usb2");
++	if (IS_ERR(ucsi->hsphy))
++		return dev_err_probe(dev, PTR_ERR(ucsi->hsphy),
++				     "unable to acquire usb2 phy\n");
++
+ 	ucsi->ucsi = ucsi_create(dev, &pmic_glink_ucsi_ops);
+ 	if (IS_ERR(ucsi->ucsi))
+ 		return PTR_ERR(ucsi->ucsi);
+@@ -455,6 +591,30 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
+ 		ucsi->port_orientation[port] = desc;
+ 	}
+ 
++	/*
++	 * nicole: "otg-gpios" on the pmic-glink node is Razer's OTG switch
++	 * (GPIO 356 in their 5.4 kernel), on while the port sources VBUS.
++	 */
++	ucsi->otg_gpio = devm_gpiod_get_optional(dev, "otg", GPIOD_OUT_LOW);
++	if (IS_ERR(ucsi->otg_gpio))
++		return dev_err_probe(dev, PTR_ERR(ucsi->otg_gpio),
++				     "unable to acquire otg gpio\n");
++
++	/* "ocp-gpios": the switch's over-current flag, asserted on a fault */
++	if (ucsi->otg_gpio) {
++		ucsi->ocp_gpio = devm_gpiod_get_optional(dev, "ocp", GPIOD_IN);
++		if (IS_ERR(ucsi->ocp_gpio))
++			return dev_err_probe(dev, PTR_ERR(ucsi->ocp_gpio),
++					     "unable to acquire ocp gpio\n");
++	}
++	/* Without the interrupt the switch still limits current itself: warn, go on */
++	if (ucsi->ocp_gpio &&
++	    devm_request_threaded_irq(dev, gpiod_to_irq(ucsi->ocp_gpio), NULL,
++				      pmic_glink_ucsi_ocp_irq,
++				      IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
++				      "usb-c-ocp", ucsi))
++		dev_warn(dev, "no over-current interrupt\n");
++
+ 	ucsi->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_USBC,
+ 						    pmic_glink_ucsi_callback,
+ 						    pmic_glink_ucsi_pdr_notify,
+@@ -464,6 +624,16 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
+ 
+ 	pmic_glink_client_register(ucsi->client);
+ 
++	/* Also listen to the battery manager for USB-C role changes */
++	ucsi->battmgr_client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
++							    pmic_glink_ucsi_battmgr_callback,
++							    pmic_glink_ucsi_battmgr_pdr_notify,
++							    ucsi);
++	if (IS_ERR(ucsi->battmgr_client))
++		return PTR_ERR(ucsi->battmgr_client);
++
++	pmic_glink_client_register(ucsi->battmgr_client);
++
+ 	return 0;
+ }
+ 
+@@ -474,12 +644,14 @@ static void pmic_glink_ucsi_remove(struct auxiliary_device *adev)
+ 	/* Callbacks can queue work until devres releases the client */
+ 	disable_work_sync(&ucsi->notify_work);
+ 	disable_work_sync(&ucsi->register_work);
++	disable_work_sync(&ucsi->battmgr_work);
+ 
+ 	/* register_work may have unregistered the instance already */
+ 	if (ucsi->ucsi_registered) {
+ 		ucsi->ucsi_registered = false;
+ 		ucsi_unregister(ucsi->ucsi);
+ 	}
++	disable_delayed_work_sync(&ucsi->hsphy_work);
+ }
+ 
+ static const struct auxiliary_device_id pmic_glink_ucsi_id_table[] = {

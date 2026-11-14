@@ -1,0 +1,99 @@
+# Reference: <https://postmarketos.org/vendorkernel>
+#
+# DRAFT mainline kernel package for the Razer Edge Wi-Fi (nicole). Local use only.
+# Based on linux-sony-pdx215 (same SoC family), but built with GCC instead of LLVM.
+#
+# Config / patches - generated, not hand-edited:
+#   Inside the build VM run
+#       scripts/build/build-kernel.sh --tag v7.3-rc6 --export-config
+#   which (a) merges arch/arm64/configs/defconfig + scripts/build/razer.config and copies
+#   the resulting full .config here as config-razer-nicole.aarch64, and (b) exports every
+#   project change (dts/sm8350-razer-nicole.dts + Makefile entry with DTC_FLAGS -@,
+#   drivers/**/*.patch, the FT3658S touchscreen driver) as one diff:
+#   0001-nicole-local-changes.patch. Keep pkgver in sync with the --tag used there
+#   (v7.3-rc6 -> 7.3_rc6), then run "pmbootstrap checksum linux-razer-nicole".
+#   Keep razer.config the single source of truth: change it, re-run the script,
+#   never edit config-razer-nicole.aarch64 by hand (pmbootstrap kconfig check reports
+#   options postmarketOS needs; add those to razer.config too).
+_flavor="razer-nicole"
+pkgname=linux-$_flavor
+pkgver=7.3_rc6
+pkgrel=33
+pkgdesc="Mainline kernel for Razer Edge Wi-Fi (nicole)"
+arch="aarch64"
+_carch="arm64"
+url="https://kernel.org"
+license="GPL-2.0-only"
+options="
+	!strip
+	!check
+	!tracedeps
+	pmb:cross-native
+	pmb:kconfigcheck-nftables
+"
+makedepends="
+	bash
+	bc
+	bison
+	diffutils
+	elfutils-dev
+	findutils
+	flex
+	gmp-dev
+	linux-headers
+	mpc1-dev
+	mpfr-dev
+	openssl-dev
+	pahole
+	perl
+	postmarketos-installkernel
+	python3
+	sed
+	zstd
+"
+
+_tag="v${pkgver/_rc/-rc}"
+_config="config-$_flavor.$arch"
+
+source="
+	linux-$_tag.tar.gz::https://git.kernel.org/torvalds/t/linux-${_tag#v}.tar.gz
+	$_config
+	0001-nicole-local-changes.patch
+"
+builddir="$srcdir/linux-${_tag#v}"
+
+prepare() {
+	default_prepare
+	cp "$srcdir/$_config" .config
+}
+
+build() {
+	unset LDFLAGS
+	make ARCH="$_carch" CC="${CC:-gcc}" \
+		KBUILD_BUILD_VERSION="$((pkgrel + 1))-$_flavor"
+}
+
+package() {
+	mkdir -p "$pkgdir"/boot
+
+	install -Dm644 "$builddir/arch/$_carch/boot/Image.gz" \
+		"$pkgdir/boot/vmlinuz"
+
+	make modules_install dtbs_install \
+		ARCH="$_carch" \
+		INSTALL_PATH="$pkgdir"/boot/ \
+		INSTALL_MOD_PATH="$pkgdir"/usr \
+		INSTALL_MOD_STRIP=1 \
+		INSTALL_DTBS_PATH="$pkgdir/boot/dtbs"
+	rm -f "$pkgdir"/usr/lib/modules/*/build "$pkgdir"/usr/lib/modules/*/source
+
+	install -D "$builddir"/include/config/kernel.release \
+		"$pkgdir"/usr/share/kernel/$_flavor/kernel.release
+}
+
+# Filled by: pmbootstrap checksum linux-razer-nicole
+sha512sums="
+49f0e5aac43587a39f3de04125749ff89006b4fb49a606d7eb1f6e6b10ec8c50743bfbb09d809741c1412c348e4235b15acaa6109d3de8dfe96f98861e1a6160  linux-v7.3-rc6.tar.gz
+05e85eb476595f089ecb3e05910347b553d619f13a2ddb138bcd5b4b5a7d3d967330c49d29b47e1b56e6ec825b0c42d00fa2e39573936bc1660a35a0bb5516d9  config-razer-nicole.aarch64
+9264f26cc2a2b9d45005b87c6e0cc07b46bf7cbf6e8e37e180ef89a25ea35106399c1caac6024268d1de9d2c327dc0826c2cc4d02f5a248d48ca3aa5e63561fd  0001-nicole-local-changes.patch
+"

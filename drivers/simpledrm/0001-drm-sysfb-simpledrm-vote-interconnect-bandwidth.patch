@@ -1,0 +1,148 @@
+From: Razer Edge nicole bring-up
+Subject: [PATCH] drm/sysfb: simpledrm: vote bandwidth on the framebuffer's interconnect paths
+
+A bootloader-initialised display keeps scanning out of the framebuffer
+while simpledrm drives it, but nothing holds an interconnect vote for the
+display controller's memory paths. On Qualcomm SoCs the interconnect
+providers drop the bootloader's votes once they reach sync_state(); with
+no vote left on the MDP path the scanout stalls the NoC and takes USB, the
+SD card and finally the whole system down (Razer Edge, SM8350: reproduced
+by binding the last interconnect consumer at runtime, fixed by holding any
+vote on qxm_mdp0 -> ebi, even 1 kB/s).
+
+Handle an "interconnects" property on the simple-framebuffer node like
+clocks, regulators and power-domains: acquire the paths first (so a
+deferral leaves clocks and regulators untouched) and, once the size is
+known, vote for one full framebuffer read per frame at 60 Hz.
+
+--- a/drivers/gpu/drm/sysfb/simpledrm.c	2026-10-25 18:14:42.343749716 +0300
++++ b/drivers/gpu/drm/sysfb/simpledrm.c	2026-10-25 18:14:42.351539259 +0300
+@@ -2,6 +2,7 @@
+ 
+ #include <linux/aperture.h>
+ #include <linux/clk.h>
++#include <linux/interconnect.h>
+ #include <linux/minmax.h>
+ #include <linux/of_address.h>
+ #include <linux/of_clk.h>
+@@ -244,6 +245,11 @@
+ 	struct device **pwr_dom_devs;
+ 	struct device_link **pwr_dom_links;
+ #endif
++	/* interconnects */
++#if defined CONFIG_OF && defined CONFIG_INTERCONNECT
++	unsigned int icc_count;
++	struct icc_path **icc_paths;
++#endif
+ 
+ 	/* modesetting */
+ 	u32 formats[DRM_SYSFB_PLANE_NFORMATS(1)];
+@@ -566,6 +572,89 @@
+ }
+ #endif
+ 
++#if defined CONFIG_OF && defined CONFIG_INTERCONNECT
++/*
++ * Interconnect handling code.
++ *
++ * Here we handle the interconnects property of our "simple-framebuffer" dt
++ * node. The bootloader left the display controller scanning out of the
++ * framebuffer, so its paths to memory must keep a bandwidth vote. Without
++ * one, the interconnect providers drop the bootloader's votes once they
++ * reach sync_state() and the scanout can stall the whole bus.
++ *
++ * The paths are acquired before anything else, so that a deferred probe
++ * leaves the clocks and regulators untouched. The vote is placed once the
++ * framebuffer size is known: one full framebuffer read per frame at 60 Hz.
++ *
++ * When the driver unloads, we drop the votes and release the paths.
++ */
++static void simpledrm_device_release_icc(void *res)
++{
++	struct simpledrm_device *sdev = res;
++	unsigned int i;
++
++	for (i = 0; i < sdev->icc_count; ++i)
++		icc_put(sdev->icc_paths[i]);
++}
++
++static int simpledrm_device_init_icc(struct simpledrm_device *sdev)
++{
++	struct drm_device *dev = &sdev->sysfb.dev;
++	struct device_node *of_node = dev->dev->of_node;
++	struct icc_path *path;
++	unsigned int i;
++	int count, ret;
++
++	/* each path is a source and a destination specifier */
++	count = of_count_phandle_with_args(of_node, "interconnects", "#interconnect-cells");
++	if (count <= 0)
++		return 0;
++	count /= 2;
++
++	sdev->icc_paths = drmm_kcalloc(dev, count, sizeof(*sdev->icc_paths), GFP_KERNEL);
++	if (!sdev->icc_paths)
++		return -ENOMEM;
++
++	for (i = 0; i < count; ++i) {
++		path = of_icc_get_by_index(dev->dev, i);
++		if (IS_ERR(path)) {
++			ret = PTR_ERR(path);
++			if (ret == -EPROBE_DEFER) {
++				simpledrm_device_release_icc(sdev);
++				return ret;
++			}
++			drm_warn(dev, "interconnect path %u not available: %d\n", i, ret);
++			continue;
++		}
++		sdev->icc_paths[sdev->icc_count++] = path;
++	}
++
++	return devm_add_action_or_reset(dev->dev, simpledrm_device_release_icc, sdev);
++}
++
++static void simpledrm_device_vote_icc(struct simpledrm_device *sdev, u64 size)
++{
++	struct drm_device *dev = &sdev->sysfb.dev;
++	u32 bw = kBps_to_icc(div_u64(size * 60, 1000));
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < sdev->icc_count; ++i) {
++		ret = icc_set_bw(sdev->icc_paths[i], bw, bw);
++		if (ret)
++			drm_warn(dev, "interconnect vote %u failed: %d\n", i, ret);
++	}
++}
++#else
++static int simpledrm_device_init_icc(struct simpledrm_device *sdev)
++{
++	return 0;
++}
++
++static void simpledrm_device_vote_icc(struct simpledrm_device *sdev, u64 size)
++{ }
++#endif
++
+ /*
+  * Modesetting
+  */
+@@ -647,6 +736,9 @@
+ 	 * Hardware settings
+ 	 */
+ 
++	ret = simpledrm_device_init_icc(sdev);
++	if (ret)
++		return ERR_PTR(ret);
+ 	ret = simpledrm_device_init_clocks(sdev);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+@@ -736,6 +828,8 @@
+ 	sysfb->fb_format = format;
+ 	sysfb->fb_pitch = stride;
+ 
++	simpledrm_device_vote_icc(sdev, size);
++
+ 	drm_dbg(dev, "display mode={" DRM_MODE_FMT "}\n", DRM_MODE_ARG(&sysfb->fb_mode));
+ 	drm_dbg(dev, "framebuffer format=%p4cc, size=%dx%d, stride=%d byte\n",
+ 		&format->format, width, height, stride);

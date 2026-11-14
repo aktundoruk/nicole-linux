@@ -1,0 +1,42 @@
+From: Razer Edge port draft
+Subject: [PATCH] phy: qcom: snps-femto-v2: hand the datapath back in device mode
+
+On the Razer Edge (SM8350) with the Type-C graph in place (pmic_glink altmode
+enabled) the ADSP's charger detection takes DP/DM over on every sink attach:
+about 11 ms after the partner shows up, USB2_PHY_USB_PHY_CFG0 has
+UTMI_PHY_DATAPATH_CTRL_OVERRIDE_EN set and UTMI_CTRL0 OPMODE is non-driving.
+Nothing in Linux writes either. The host resets the bus, the gadget stays in
+"default" and the link suspends. The downstream kernel re-initialises the PHY
+on every attach and never notices; mainline initialises it once.
+
+Clear both when peripheral mode is set on an initialised PHY. The host
+re-enumerates on its own once they are clear (seen: "configured" within a
+few seconds, no gadget re-bind). ucsi_glink calls this after a sink attach.
+
+Found on the Razer Edge (31 Ekim 2026) with a 10 ms register watch.
+---
+diff --git a/drivers/phy/qualcomm/phy-qcom-snps-femto-v2.c b/drivers/phy/qualcomm/phy-qcom-snps-femto-v2.c
+index 980ad1fb1..adf8d81b5 100644
+--- a/drivers/phy/qualcomm/phy-qcom-snps-femto-v2.c
++++ b/drivers/phy/qualcomm/phy-qcom-snps-femto-v2.c
+@@ -232,6 +232,20 @@ static int qcom_snps_hsphy_set_mode(struct phy *phy, enum phy_mode mode,
+ 	struct qcom_snps_hsphy *hsphy = phy_get_drvdata(phy);
+ 
+ 	hsphy->mode = mode;
++
++	/*
++	 * Charger detection in the ADSP (seen on SM8350) takes DP/DM over on
++	 * every attach and leaves the PHY non-driving with the UTMI datapath
++	 * overridden: the host resets the bus and enumeration stalls. Hand the
++	 * datapath back to the controller when peripheral mode is asked for.
++	 */
++	if (mode == PHY_MODE_USB_DEVICE && hsphy->phy_initialized) {
++		qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_UTMI_CTRL0,
++					   OPMODE_MASK, OPMODE_NORMAL);
++		qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_CFG0,
++					   UTMI_PHY_DATAPATH_CTRL_OVERRIDE_EN, 0);
++	}
++
+ 	return 0;
+ }
+ 

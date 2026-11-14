@@ -1,0 +1,18 @@
+# Add to drivers/input/misc/Kconfig (after INPUT_AW86927):
+
+config INPUT_AW8622X
+	tristate "Awinic AW8622x haptic driver support"
+	depends on I2C
+	select INPUT_FF_MEMLESS
+	select REGMAP_I2C
+	help
+	  Say Y here to enable support for the Awinic AW8622x (AW86223,
+	  AW86224, AW86225) LRA haptic controller, as found in the Razer
+	  Edge, in continuous (resonance tracking) mode.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called aw8622x.
+
+# Add to drivers/input/misc/Makefile:
+#
+# obj-$(CONFIG_INPUT_AW8622X)		+= aw8622x.o

@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""nicole-slot: nicole's A/B slot state; keeps A's tries full, keeps B ready as the rescue,
+and moves between the two without fastboot.
+
+ABL keeps each slot's state in the GPT attributes of its boot_x entry (LUN 4, 4096-byte
+blocks): priority bits 48-49, active 50, tries 51-53, successful 54, unbootable 55. Its rules
+(abl LA.UM.9.14.1, PartitionTableUpdate.c, FindBootableSlot / HandleActiveSlotUnbootable):
+  - it boots the active slot with the higher priority; one not "successful" loses a try per
+    boot; at 0 tries ABL marks it unbootable and moves to the other slot ONLY IF that one is
+    "successful" and not unbootable; else "No bootable slot" (fastboot);
+  - the move itself (SetActiveSlot) is ABL's own: the other slot's partitions' type GUIDs
+    swapped, the active bit on every _a/_b partition in four LUNs, the UFS boot LUN, a cold
+    reset. This tool never does that part: it only sets the two boot_x bytes so that ABL does.
+
+Policy (docs/guvenlik-kurallari.md §8 Faz 4): A is the daily system, B the rescue Linux.
+  tazele   on A: A's tries back to 7 and its successful bit off (seven failed boots in a row
+           still leave A); B not unbootable and successful (ABL's fallback needs that).
+           On B: B's own tries, if B is not successful. A is left as it is.
+  gec X    move to slot X at the next boot: X not unbootable, successful, 7 tries; the
+           running slot successful off and 0 tries. On the reboot ABL finds the running slot
+           out of tries, marks it unbootable, finds X bootable and switches to it. From B,
+           "gec a" returns to a repaired A (nicole-a-onar); from A, "gec b" goes to the rescue.
+           On arrival, tazele (on A) makes B ready again.
+
+That GPT also holds abl, tz, hyp, aop and devcfg: a bad write there could leave the phone
+unable to reach even fastboot. So the write is as small and as checked as it can be:
+  - both GPT copies are read and must be valid (header and entry CRCs) and identical in
+    their entries; entries are found by name;
+  - only the attribute byte holding bits 48-55 changes in each entry (boot_a, boot_b), plus
+    the two CRCs in each header; the new blocks are built in memory and compared with the
+    old ones byte by byte (anything else differing: refused);
+  - the backup copy is written and read back first, then the primary: at every moment one
+    complete, valid copy exists; each write is one 4096-byte block (the device's own);
+  - writes need the kernel's UFS write guard to open exactly these blocks.
+
+  nicole-slot durum [AYGIT]                  both slots' state (read only)
+  nicole-slot tazele [--kuru] [AYGIT]        see above (the timer runs it after each boot)
+  nicole-slot gec a|b [--kuru] [AYGIT]       see above, then reboot
+AYGIT: the LUN with boot_a (default: found from /dev/disk/by-partlabel/boot_a), or an image
+file (tests); slot from androidboot.slot_suffix, or --slot for an image.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import struct
+import sys
+import time
+import zlib
+
+BLOK = 4096
+IMZA = b"EFI PART"
+DENEME_EN_COK = 7
+ALANLAR = ("öncelik", "etkin", "deneme", "başarılı", "açılamaz")
+
+
+def hata(ileti: str) -> None:
+    sys.exit(f"nicole-slot: {ileti}")
+
+
+def bayt(oz: int) -> int:
+    """Byte 6 of the 64-bit attribute field holds bits 48-55."""
+    return (oz >> 48) & 0xFF
+
+
+def coz(b: int) -> dict:
+    return {"öncelik": b & 3, "etkin": (b >> 2) & 1, "deneme": (b >> 3) & 7,
+            "başarılı": (b >> 6) & 1, "açılamaz": (b >> 7) & 1}
+
+
+class Gpt:
+    """One GPT copy: header block number, header bytes, entry array bytes."""
+
+    def __init__(self, f, lba: int) -> None:
+        self.lba = lba
+        self.baslik = oku(f, lba)
+        h = self.baslik
+        if h[:8] != IMZA:
+            hata(f"LBA {lba}: GPT imzası yok")
+        self.boy, = struct.unpack_from("<I", h, 12)
+        if not 92 <= self.boy <= BLOK:
+            hata(f"LBA {lba}: başlık boyu {self.boy}")
+        crc, = struct.unpack_from("<I", h, 16)
+        if crc != self.baslik_crc(h):
+            hata(f"LBA {lba}: başlık CRC tutmuyor")
+        self.kendi, self.diger = struct.unpack_from("<QQ", h, 24)
+        if self.kendi != lba:
+            hata(f"LBA {lba}: başlık kendini {self.kendi} sanıyor")
+        self.giris_lba, = struct.unpack_from("<Q", h, 72)
+        self.sayi, self.giris_boy, self.giris_crc = struct.unpack_from("<III", h, 80)
+        if self.giris_boy != 128 or not 1 <= self.sayi <= 1024:
+            hata(f"LBA {lba}: giriş düzeni {self.sayi}x{self.giris_boy}")
+        n = -(-self.sayi * self.giris_boy // BLOK)
+        self.girisler = b"".join(oku(f, self.giris_lba + i) for i in range(n))
+        if zlib.crc32(self.girisler[:self.sayi * 128]) != self.giris_crc:
+            hata(f"LBA {lba}: giriş CRC tutmuyor")
+
+    def baslik_crc(self, h: bytes) -> int:
+        return zlib.crc32(h[:16] + b"\0\0\0\0" + h[20:self.boy])
+
+    def bul(self, ad: str) -> int:
+        for i in range(self.sayi):
+            e = self.girisler[i * 128:(i + 1) * 128]
+            if e[56:128].decode("utf-16-le").rstrip("\0") == ad:
+                return i
+        hata(f"{ad} girdisi yok")
+
+    def oznitelik(self, i: int) -> int:
+        return struct.unpack_from("<Q", self.girisler, i * 128 + 48)[0]
+
+    def yeni(self, degisim: dict[int, int]) -> tuple[bytes, dict[int, bytes]]:
+        """(new header block, {entry block number: new block}) with one byte changed per
+        entry: degisim = {entry index: new attribute byte}."""
+        g = bytearray(self.girisler)
+        for i, b in degisim.items():
+            g[i * 128 + 48 + 6] = b
+        h = bytearray(self.baslik)
+        struct.pack_into("<I", h, 88, zlib.crc32(bytes(g[:self.sayi * 128])))
+        struct.pack_into("<I", h, 16, 0)
+        struct.pack_into("<I", h, 16, zlib.crc32(bytes(h[:self.boy])))
+        bloklar = {}
+        for i in degisim:
+            k = i * 128 // BLOK
+            bloklar[self.giris_lba + k] = bytes(g[k * BLOK:(k + 1) * BLOK])
+        return bytes(h), bloklar
+
+
+def oku(f, lba: int) -> bytes:
+    f.seek(lba * BLOK)
+    b = f.read(BLOK)
+    if len(b) != BLOK:
+        hata(f"LBA {lba} okunamadı")
+    return b
+
+
+def yaz(f, lba: int, veri: bytes) -> None:
+    assert len(veri) == BLOK
+    f.seek(lba * BLOK)
+    f.write(veri)
+    f.flush()
+    os.fsync(f.fileno())
+    if oku(f, lba) != veri:
+        hata(f"LBA {lba}: geri okunan yazılanla aynı değil")
+
+
+def ikisi(f, toplam_blok: int) -> tuple[Gpt, Gpt]:
+    a = Gpt(f, 1)
+    if a.diger != toplam_blok - 1:
+        hata(f"yedek başlık {a.diger}, diskin son bloğu {toplam_blok - 1}")
+    b = Gpt(f, a.diger)
+    if b.diger != 1 or b.sayi != a.sayi:
+        hata("yedek başlık birincile uymuyor")
+    if a.girisler[:a.sayi * 128] != b.girisler[:b.sayi * 128]:
+        hata("iki GPT kopyasının girişleri farklı: elle bakılmalı")
+    if a.giris_lba == b.giris_lba or b.giris_lba + len(b.girisler) // BLOK > b.lba:
+        hata("yedek girişlerin yeri tuhaf")
+    return a, b
+
+
+def aygit_bul() -> str:
+    p = os.path.realpath("/dev/disk/by-partlabel/boot_a")
+    m = re.fullmatch(r"/dev/(sd[a-z]+)\d+", p)
+    if not m:
+        hata(f"boot_a bulunamadı ({p})")
+    return f"/dev/{m[1]}"
+
+
+def toplam(yol: str, f) -> int:
+    f.seek(0, os.SEEK_END)
+    boy = f.tell()
+    if boy % BLOK:
+        hata(f"{yol}: boy {BLOK}'ün katı değil")
+    return boy // BLOK
+
+
+def korunan_bloklar_acik(yol: str, bloklar: list[int]) -> bool | str:
+    """True when the kernel's UFS write guard lets every block through (an image file
+    always does), else why not: refuse before the first write rather than halfway."""
+    import stat
+    if not stat.S_ISBLK(os.stat(yol).st_mode):
+        return True
+    ad = os.path.basename(os.path.realpath(yol))
+    try:
+        lun = int(os.path.basename(os.path.realpath(f"/sys/block/{ad}/device")).split(":")[3])
+        with open("/sys/module/ufshcd_core/parameters/write_ranges") as f:
+            metin = f.read().strip()
+    except (OSError, IndexError, ValueError) as e:
+        return f"yazma koruması okunamadı ({e})"
+    araliklar = [tuple(map(int, a.split(":"))) for a in metin.split(",") if a]
+    kapali = [b for b in bloklar
+              if not any(l == lun and bas <= b < bas + boy for l, bas, boy in araliklar)]
+    if kapali:
+        return f"çekirdeğin yazma aralığı ({metin}) LU {lun} blokları {kapali} kapsamıyor"
+    return True
+
+
+def calisan_slot() -> str:
+    with open("/proc/cmdline") as f:
+        m = re.search(r"androidboot\.slot_suffix=_([ab])\b", f.read())
+    if not m:
+        hata("çalışan slot bilinmiyor (androidboot.slot_suffix yok)")
+    return m[1]
+
+
+def durum(yol: str) -> int:
+    with open(yol, "rb") as f:
+        a, _ = ikisi(f, toplam(yol, f))
+        for s in "ab":
+            i = a.bul(f"boot_{s}")
+            d = coz(bayt(a.oznitelik(i)))
+            print(f"{s}: " + " ".join(f"{k}={d[k]}" for k in ALANLAR))
+    return 0
+
+
+def bayt_yap(d: dict) -> int:
+    return (d["öncelik"] | d["etkin"] << 2 | d["deneme"] << 3 | d["başarılı"] << 6
+            | d["açılamaz"] << 7)
+
+
+def yaz_plan(yol: str, istek: dict[str, dict], kuru: bool) -> int:
+    """istek = {"boot_a": {"deneme": 7, ...}, ...}: the fields to set in each entry.
+    Everything else in the byte stays. Prints the plan; writes it unless kuru."""
+    with open(yol, "rb" if kuru else "r+b", buffering=0) as f:
+        n = toplam(yol, f)
+        a, b = ikisi(f, n)
+        degisim, satirlar = {}, []
+        for ad, alanlar in istek.items():
+            i = a.bul(ad)
+            eski = bayt(a.oznitelik(i))
+            d = coz(eski)
+            d.update(alanlar)
+            yeni = bayt_yap(d)
+            if yeni != eski:
+                degisim[i] = yeni
+                satirlar.append(f"{ad}: 0x{eski:02x} -> 0x{yeni:02x} ("
+                                + " ".join(f"{k}={coz(eski)[k]}->{d[k]}" for k in ALANLAR
+                                           if coz(eski)[k] != d[k]) + ")")
+        if not degisim:
+            print("yazılacak bir şey yok")
+            return 0
+        plan = []
+        for g in (b, a):  # backup first: the primary stays whole until the backup is done
+            hb, eb = g.yeni(degisim)
+            beklenen = {}
+            for i in degisim:
+                beklenen.setdefault(g.giris_lba + i * 128 // BLOK, []).append(i * 128 % BLOK + 54)
+            if set(eb) != set(beklenen):
+                hata(f"beklenmeyen giriş blokları {sorted(eb)}")
+            for elba, blok in eb.items():
+                eski_e = oku(f, elba)
+                fark = [j for j in range(BLOK) if blok[j] != eski_e[j]]
+                if fark != sorted(beklenen[elba]):
+                    hata(f"LBA {elba}: beklenmeyen fark {fark}")
+            fark_h = [j for j in range(BLOK) if hb[j] != g.baslik[j]]
+            if not set(fark_h) <= set(range(16, 20)) | set(range(88, 92)):
+                hata(f"LBA {g.lba}: başlıkta beklenmeyen fark {fark_h}")
+            plan.append((g.lba, hb, eb))
+        for s_ in satirlar:
+            print(s_)
+        print("yazılacak bloklar: " + "; ".join(
+            ", ".join(map(str, sorted(eb))) + f" ve {h}" for h, _, eb in plan))
+        if kuru:
+            return 0
+        acik = korunan_bloklar_acik(yol, [l for h, _, eb in plan for l in (*eb, h)])
+        if acik is not True:
+            hata(acik)
+        for hlba, hb, eb in plan:
+            for elba, blok in sorted(eb.items()):
+                yaz(f, elba, blok)
+            yaz(f, hlba, hb)
+        a2, b2 = ikisi(f, n)  # re-read: both copies valid and identical, with the new bytes
+        for i, yb in degisim.items():
+            if bayt(a2.oznitelik(i)) != yb or bayt(b2.oznitelik(i)) != yb:
+                hata("yazdıktan sonra okunan öznitelik beklenen değil")
+    print("yazıldı, iki kopya da okundu ve doğrulandı")
+    return 0
+
+
+def durumlar(yol: str) -> dict[str, dict]:
+    with open(yol, "rb") as f:
+        a, _ = ikisi(f, toplam(yol, f))
+        return {s: coz(bayt(a.oznitelik(a.bul(f"boot_{s}")))) for s in "ab"}
+
+
+def tazele(yol: str, slot: str, kuru: bool) -> int:
+    d = durumlar(yol)
+    if d[slot]["açılamaz"]:
+        hata(f"boot_{slot} açılamaz işaretli ama çalışıyor; dokunulmuyor")
+    if slot == "b":
+        if d["b"]["başarılı"]:
+            print("b: başarılı işaretli, deneme sayılmıyor; yazılacak bir şey yok")
+            return 0
+        return yaz_plan(yol, {"boot_b": {"deneme": DENEME_EN_COK}}, kuru)
+    istek = {"boot_a": {"deneme": DENEME_EN_COK, "başarılı": 0}}
+    if d["b"]["etkin"]:
+        print("uyarı: A çalışırken B etkin işaretli; B'ye dokunulmuyor")
+    else:
+        istek["boot_b"] = {"açılamaz": 0, "başarılı": 1}  # the rescue ABL can fall back to
+    return yaz_plan(yol, istek, kuru)
+
+
+def gec(yol: str, slot: str, hedef: str, kuru: bool) -> int:
+    if hedef == slot:
+        hata(f"zaten slot {slot}'dayız")
+    d = durumlar(yol)
+    if not d[slot]["etkin"] or d[hedef]["etkin"]:
+        hata(f"etkin bitleri beklenmedik (a={d['a']['etkin']}, b={d['b']['etkin']}); dokunulmuyor")
+    r = yaz_plan(yol, {f"boot_{hedef}": {"açılamaz": 0, "başarılı": 1, "deneme": DENEME_EN_COK},
+                       f"boot_{slot}": {"başarılı": 0, "deneme": 0}}, kuru)
+    if not kuru:
+        print(f"yeniden başlatınca ABL slot {slot}'yı açılamaz işaretleyip slot {hedef}'ya geçer "
+              f"(bir soğuk yeniden başlatma daha)")
+    return r
+
+
+DURUM_DOSYASI = os.environ.get("NICOLE_SLOT_DURUM", "/run/nicole-slot.durum")
+
+
+def durum_dosyasi(yol: str, slot: str) -> None:
+    """Both slots' bits, read back after tazele, for the settings app (read only; it has
+    no access to the disk). Never a reason to fail."""
+    try:
+        veri = {"calisan": slot, "zaman": int(time.time()), "slotlar": durumlar(yol)}
+        gecici = DURUM_DOSYASI + ".yeni"
+        with open(gecici, "w") as f:
+            json.dump(veri, f)
+        os.chmod(gecici, 0o644)
+        os.replace(gecici, DURUM_DOSYASI)
+    except (OSError, ValueError, SystemExit):
+        pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("komut", choices=["durum", "tazele", "gec"])
+    p.add_argument("args", nargs="*", help="gec için hedef slot (a|b), sonra isteğe bağlı AYGIT")
+    p.add_argument("--kuru", action="store_true", help="yazmadan ne yapacağını söyle")
+    p.add_argument("--slot", choices=["a", "b"], help="görüntü dosyasında denemek için")
+    o = p.parse_intermixed_args(argv)
+    args = list(o.args)
+    hedef = None
+    if o.komut == "gec":
+        if not args or args[0] not in ("a", "b"):
+            hata("gec a|b")
+        hedef = args.pop(0)
+    if len(args) > 1:
+        hata("fazla argüman")
+    yol = args[0] if args else aygit_bul()
+    if o.komut == "durum":
+        return durum(yol)
+    slot = o.slot or calisan_slot()
+    if o.komut == "tazele":
+        r = tazele(yol, slot, o.kuru)
+        if not o.kuru and o.slot is None:
+            durum_dosyasi(yol, slot)
+        return r
+    return gec(yol, slot, hedef, o.kuru)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

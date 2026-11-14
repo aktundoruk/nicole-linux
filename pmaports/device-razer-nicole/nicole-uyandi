@@ -1,0 +1,33 @@
+#!/bin/sh
+# nicole-uyandi (device r32, 10 Kasım 2026): after a wake from s2idle, make sure a power key
+# press also brings the screen back.
+# The power key wakes the phone (pmic_pwrkey) and pm8941-pwrkey reports a press for it, so
+# sway's binding (a screen toggle) normally turns the screen on itself once the user
+# slice is thawed. If that press never reaches sway the phone would be awake with a dark
+# screen. Started by the nicole-uyku hook through systemd-run (the hook runs while sway is
+# still frozen): waits until sway answers, gives a press that did reach it 1.5 s to act, and
+# only then turns a still dark screen on. Any other wake (RTC alarm, charger, Bluetooth)
+# leaves the screen off, for an automatic sleep service to put the phone back to sleep.
+# Test hook: NICOLE_UYANDI_IRQ replaces /sys/power/pm_wakeup_irq.
+irq=${NICOLE_UYANDI_IRQ:-$(cat /sys/power/pm_wakeup_irq 2>/dev/null)}
+ad=$(awk -v n="$irq:" '$1 == n { print $NF }' /proc/interrupts)
+if [ "$ad" != pmic_pwrkey ]; then
+	echo "nicole-uyandi: uyandıran ${irq:-?} (${ad:-?}), ekrana dokunulmadı"
+	exit 0
+fi
+sock=
+for s in /run/user/*/sway-ipc.*.sock; do [ -S "$s" ] && sock=$s; done
+[ -n "$sock" ] || { echo "nicole-uyandi: sway yok"; exit 0; }
+export SWAYSOCK=$sock
+i=0
+until timeout 2 swaymsg -t get_version >/dev/null 2>&1; do
+	i=$((i + 1)); [ $i -ge 10 ] && { echo "nicole-uyandi: sway yanıt vermiyor"; exit 0; }
+	sleep 0.5
+done
+sleep 1.5
+if swaymsg -t get_outputs | grep -q '"power": true'; then
+	echo "nicole-uyandi: güç tuşu, ekran zaten açık"
+	exit 0
+fi
+swaymsg -q output '*' power on
+echo "nicole-uyandi: güç tuşu, ekran açıldı"

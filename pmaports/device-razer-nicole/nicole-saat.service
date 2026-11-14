@@ -1,0 +1,7 @@
+[Unit]
+Description=Save clock offset and RTC value (nicole-saat)
+After=swclock-offset-boot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/nicole-saat kaydet

@@ -1,0 +1,114 @@
+From 28d31c6621a2e989506e907a793829db2c89f052 Mon Sep 17 00:00:00 2001
+From: Doruk Aktun <info@dorukaktun.com>
+Date: Sat, 7 Nov 2026 21:38:16 +0300
+Subject: [PATCH] ipa: simple: agc: Allow tuning the exposure step from the
+ tuning file
+
+The proportional gain and the maximum step of the exposure controller
+are compile-time constants. The correction is applied to the exposure
+the frame was captured with, so with sensor control delays of N frames
+the same correction is repeated for N + 1 frames before the statistics
+show its effect, and the effective rate is one step per N + 1 frames.
+For a sensor with delays of 2 (SK Hynix Hi-556) going from a short
+exposure to a dim room took more than 8 seconds.
+
+Read optional "proportionalGain" and "maxStep" values from the Agc
+tuning data, keeping the current constants as defaults.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ src/ipa/simple/algorithms/agc.cpp | 32 +++++++++++++++++++++++++++++--
+ src/ipa/simple/algorithms/agc.h   |  5 +++++
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index a13a755..33948ce 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <errno.h>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
+@@ -52,6 +53,13 @@ static constexpr float kExposureSatisfactory = 0.2;
+  *
+  * This replaces the fixed 10% bang-bang step with a proportional correction
+  * that converges smoothly and avoids overshooting near the target.
++ *
++ * The correction is applied to the exposure the frame was actually captured
++ * with, so with sensor control delays of N frames the same correction is
++ * repeated for N + 1 frames before its effect shows up in the statistics.
++ * The effective rate is therefore about one step per N + 1 frames, which is
++ * slow for sensors with a delay of 2. Both values can be overridden from the
++ * tuning file ("proportionalGain", "maxStep").
+  */
+ static constexpr float kExpProportionalGain = 0.04;
+ 
+@@ -62,7 +70,27 @@ static constexpr float kExpProportionalGain = 0.04;
+ static constexpr float kExpMaxStep = 0.15;
+ 
+ Agc::Agc()
++	: proportionalGain_(kExpProportionalGain), maxStep_(kExpMaxStep)
++{
++}
++
++int Agc::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
+ {
++	proportionalGain_ = tuningData["proportionalGain"].get<float>(kExpProportionalGain);
++	maxStep_ = tuningData["maxStep"].get<float>(kExpMaxStep);
++
++	if (proportionalGain_ <= 0.0f || maxStep_ <= 0.0f || maxStep_ >= 1.0f) {
++		LOG(IPASoftExposure, Error)
++			<< "Invalid AGC tuning: proportionalGain " << proportionalGain_
++			<< ", maxStep " << maxStep_;
++		return -EINVAL;
++	}
++
++	LOG(IPASoftExposure, Debug)
++		<< "proportionalGain " << proportionalGain_
++		<< ", maxStep " << maxStep_;
++
++	return 0;
+ }
+ 
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
+@@ -80,8 +108,8 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 	 * determines the direction: positive error means too dark (increase),
+ 	 * negative means too bright (decrease).
+ 	 */
+-	float step = std::clamp(static_cast<float>(error) * kExpProportionalGain,
+-				-kExpMaxStep, kExpMaxStep);
++	float step = std::clamp(static_cast<float>(error) * proportionalGain_,
++				-maxStep_, maxStep_);
+ 	float factor = 1.0f + step;
+ 
+ 	if (factor > 1.0f) {
+diff --git a/src/ipa/simple/algorithms/agc.h b/src/ipa/simple/algorithms/agc.h
+index 112d9f5..89ac585 100644
+--- a/src/ipa/simple/algorithms/agc.h
++++ b/src/ipa/simple/algorithms/agc.h
+@@ -19,6 +19,8 @@ public:
+ 	Agc();
+ 	~Agc() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++
+ 	void process(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+@@ -26,6 +28,9 @@ public:
+ 
+ private:
+ 	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++
++	float proportionalGain_;
++	float maxStep_;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+-- 
+2.53.0
+

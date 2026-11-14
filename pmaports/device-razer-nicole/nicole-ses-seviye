@@ -1,0 +1,21 @@
+#!/bin/sh
+# Speaker volume keys for the nicole shell. Ceiling = the amps' default 270 (-22.5 dB):
+# mainline has no Awinic speaker protection, so never louder than that until a safe
+# ceiling is measured (lab log, 28 Ekim).
+# Usage: nicole-ses-seviye arttir|azalt
+TAVAN=270
+ADIM=12 # 3 dB
+case "$1" in
+arttir) d=$ADIM ;;
+azalt) d=-$ADIM ;;
+*) echo "usage: nicole-ses-seviye arttir|azalt" >&2; exit 1 ;;
+esac
+v=$(amixer -c 0 cget name='Left PCM Playback Volume' | sed -n 's/^ *: values=//p')
+v=$((v + d))
+[ "$v" -gt $TAVAN ] && v=$TAVAN
+[ "$v" -lt 0 ] && v=0
+amixer -q -c 0 cset name='Left PCM Playback Volume' "$v"
+amixer -q -c 0 cset name='Right PCM Playback Volume' "$v"
+# On-screen bar (wob, started by the sway config): percent of the ceiling
+f="$XDG_RUNTIME_DIR/wob.fifo"
+[ -p "$f" ] && echo $((v * 100 / TAVAN)) > "$f"

@@ -1,0 +1,15 @@
+[Unit]
+Description=Sessiz açılış deneyi: bu açılışta LPASS ses yığınını yükleme
+DefaultDependencies=no
+# Before udev's coldplug loads modules; the root is already mounted (read-only is fine:
+# only /run is written here, sessiz-deney.sh removes the flag later).
+Before=systemd-udevd.service systemd-udev-trigger.service sysinit.target
+ConditionPathExists=/var/lib/uyku-test/sessiz-bir-kez
+
+[Service]
+Type=oneshot
+ExecStart=/bin/mkdir -p /run/modprobe.d
+ExecStart=/bin/cp /var/lib/uyku-test/uyku-sessiz-etkin.conf /run/modprobe.d/uyku-sessiz.conf
+
+[Install]
+WantedBy=sysinit.target

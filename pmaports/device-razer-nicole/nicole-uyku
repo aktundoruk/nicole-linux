@@ -1,0 +1,31 @@
+#!/bin/sh
+# systemd-sleep hook (30 Ekim 2026): take the Wi-Fi chip (WCN6851, PCI 17cb:1103) off the
+# PCIe link before suspend and bring it back after resume.
+# With the endpoint on the link, qcom-pcie's noirq suspend kills the phone (no ramoops,
+# straight to the bootloader); with it removed s2idle returns cleanly.
+# Unloading ath11k alone was not enough. Temporary until qcom-pcie/WCN6851
+# suspend is fixed in the kernel. Wi-Fi is back ~2 s after resume; NetworkManager reconnects.
+# $1 = pre|post, $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+ucler() {
+	for d in /sys/bus/pci/devices/*; do
+		[ "$(cat "$d/vendor" 2>/dev/null)" = 0x17cb ] &&
+			[ "$(cat "$d/device" 2>/dev/null)" = 0x1103 ] && echo "$d"
+	done
+}
+
+case "$1" in
+pre)
+	modprobe -r ath11k_pci 2>/dev/null
+	for d in $(ucler); do
+		echo 1 > "$d/remove" && echo "nicole-uyku: ${d##*/} hattan çıkarıldı"
+	done
+	;;
+post)
+	echo 1 > /sys/bus/pci/rescan
+	modprobe ath11k_pci && echo "nicole-uyku: Wi-Fi geri: $(ucler | sed 's|.*/||')"
+	# the screen after a power key wake: outside the hook, sway is still frozen here
+	[ -x /usr/libexec/nicole-uyandi ] && systemd-run --no-block --quiet --collect \
+		--unit="nicole-uyandi-$(date +%s)" /usr/libexec/nicole-uyandi
+	;;
+esac
+exit 0

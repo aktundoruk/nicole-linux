@@ -1,0 +1,25 @@
+# Large upstream checkouts (re-create with sources/fetch.sh)
+sources/*/
+# Device backups and proprietary firmware: never commit or upload
+yedek/
+firmware/
+*.img
+*.mbn
+*.mdt
+*.b[0-9][0-9]
+# Lab output
+log/kamera/
+log/denemeler/*/
+log/DURUM
+DUR
+out/
+dts/out/
+# More proprietary firmware formats and secrets (29 Ekim)
+*.elf
+*.tlv
+*acf*.bin
+*parola*
+*.apk
+.DS_Store
+# Marker left by the copy script (local only)
+.nicole-linux-temiz-kopya

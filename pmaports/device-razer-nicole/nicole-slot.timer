@@ -1,0 +1,8 @@
+[Unit]
+Description=Refill the running slot's boot tries 3 minutes after boot (nicole-slot)
+
+[Timer]
+OnBootSec=3min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,29 @@
+From 4d027a698b6d52251440dc450cb87e401f12e61d Mon Sep 17 00:00:00 2001
+From: Doruk Aktun <info@dorukaktun.com>
+Date: Wed, 7 Oct 2026 09:52:04 +0300
+Subject: [PATCH] dt-bindings: watchdog: qcom-wdt: Document SM8350 APSS
+ watchdog
+
+The SM8350 APSS watchdog at 0x17c10000 is the same KPSS-style block as on
+SM8250 and earlier. Add a SoC-specific compatible with the qcom,kpss-wdt
+fallback so board DTs (Razer Edge Wi-Fi "nicole") can describe it.
+
+---
+ Documentation/devicetree/bindings/watchdog/qcom-wdt.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Documentation/devicetree/bindings/watchdog/qcom-wdt.yaml b/Documentation/devicetree/bindings/watchdog/qcom-wdt.yaml
+index 4ff61102e..7a2a76631 100644
+--- a/Documentation/devicetree/bindings/watchdog/qcom-wdt.yaml
++++ b/Documentation/devicetree/bindings/watchdog/qcom-wdt.yaml
+@@ -50,6 +50,7 @@ properties:
+               - qcom,apss-wdt-sm6350
+               - qcom,apss-wdt-sm8150
+               - qcom,apss-wdt-sm8250
++              - qcom,apss-wdt-sm8350
+               - qcom,apss-wdt-x1e80100
+           - const: qcom,kpss-wdt
+       - const: qcom,kpss-wdt
+-- 
+2.53.0
+

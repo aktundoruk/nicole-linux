@@ -1,0 +1,91 @@
+# Lima VM for building mainline kernels / boot images for the Razer Edge Wi-Fi (nicole).
+#
+# Ubuntu 26.04 LTS ("resolute") arm64 on Apple Silicon with the native
+# Virtualization.framework (vz): arm64 kernels build natively, no cross compiler.
+#
+# --- Where the VM disks live ------------------------------------------------------
+# Lima keeps instance disks under $LIMA_HOME (default ~/.lima); a kernel build tree and
+# the pmbootstrap work dir need about 150 GB. Lima has no YAML key for the instance
+# directory, so if the space is on an external disk, point LIMA_HOME there *before*
+# every limactl call:
+#
+#   export LIMA_HOME=/Volumes/<external disk>/lima
+#   limactl disk create razer-build --size 150GiB  # extra ext4 disk for kernel trees/builds
+#   limactl create --name=razer --set '.param.ProjectDir="'"$PWD"'"' scripts/build/lima-razer.yaml
+#   limactl start razer
+#   limactl shell razer                            # then: bash <project>/scripts/build/vm-setup.sh
+#
+# (Put `export LIMA_HOME=...` into ~/.zshrc so `limactl` always finds the instance.)
+# The base disk (`disk:` below) holds Ubuntu + packages; the additional disk
+# "razer-build" (mounted at /mnt/lima-razer-build) holds linux sources, build output and
+# the pmbootstrap work dir. Both are sparse files inside $LIMA_HOME on the SSD.
+#
+# --- Project directory ----------------------------------------------------------
+# The project is shared into the VM at the same path (virtiofs, writable) so scripts,
+# DTS and patches are edited on the Mac and built in the VM. Build trees must NOT be
+# placed in the shared folder: APFS is case-insensitive by default (the kernel tree has
+# files that differ only in case).
+# Override the path without editing this file:
+#   limactl create --name=razer --set '.param.ProjectDir="/path/to/Razer"' scripts/build/lima-razer.yaml
+#
+# Alternative: OrbStack ("orb create ubuntu:resolute razer") works too; then run
+# vm-setup.sh inside it and set WORK=/path/on/ssd for build-kernel.sh.
+
+minimumLimaVersion: 2.0.0
+
+vmType: vz
+arch: aarch64
+
+images:
+  # Pinned release first (with digest), then the rolling "release" alias as fallback.
+  - location: "https://cloud-images.ubuntu.com/releases/resolute/release-20260927/ubuntu-26.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+    digest: "sha256:63a93bd5a8d76e33b15ceb5daa3657bd79be804748051ab178e643b0f5da22e7"
+  - location: "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 6
+memory: "8GiB"
+# Root disk: OS + toolchain + pmbootstrap deps. Sparse; lives in $LIMA_HOME/razer/.
+disk: "40GiB"
+
+param:
+  # set with --set '.param.ProjectDir="..."' (see above): the absolute path of this checkout
+  ProjectDir: "/path/to/nicole-linux"
+
+mountType: virtiofs
+mounts:
+  - location: "{{.Param.ProjectDir}}"
+    mountPoint: "{{.Param.ProjectDir}}"
+    writable: true
+
+# Created beforehand with: limactl disk create razer-build --size 150GiB
+# (the disk image itself lives in $LIMA_HOME/_disks/razer-build on the SSD)
+additionalDisks:
+  - name: "razer-build"
+    format: true
+    fsType: "ext4"
+    mountPoint: "/mnt/lima-razer-build"
+
+# Rosetta and containerd are not needed for native arm64 builds.
+containerd:
+  system: false
+  user: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      # Make the build disk writable for the default (non-root) Lima user.
+      install -d -m 0775 /mnt/lima-razer-build
+      chown "{{.User}}" /mnt/lima-razer-build || true
+      # Export project/work paths for every login shell (params are PARAM_* here).
+      cat > /etc/profile.d/razer.sh <<EOF
+      export RAZER_PROJECT="${PARAM_ProjectDir}"
+      export WORK=/mnt/lima-razer-build
+      EOF
+
+message: |
+  Razer build VM is ready.
+  Next (inside the VM): bash "$RAZER_PROJECT/scripts/build/vm-setup.sh"

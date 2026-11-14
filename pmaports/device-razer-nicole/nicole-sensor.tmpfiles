@@ -1,0 +1,5 @@
+# Writable /persist/sensors/registry for the SLPI (hexagonrpcd-yazma); never the real
+# persist partition, which stays untouched (docs/guvenlik-kurallari.md).
+d /var/lib/hexagonrpcd 0755 root root -
+d /var/lib/hexagonrpcd/persist-sensors 0755 fastrpc fastrpc -
+d /var/lib/hexagonrpcd/persist-sensors/registry 0755 fastrpc fastrpc -

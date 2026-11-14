@@ -1,0 +1,12 @@
+[Unit]
+Description=Sessiz açılış deneyi: kablosuz ADSP / derin uyku ölçümü
+# Not after multi-user.target: nicole-ses waits there for a sound card that never comes.
+After=basic.target network.target
+ConditionPathExists=/run/modprobe.d/uyku-sessiz.conf
+
+[Service]
+Type=simple
+ExecStart=/bin/sh /var/lib/uyku-test/sessiz-deney.sh
+
+[Install]
+WantedBy=multi-user.target

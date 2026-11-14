@@ -1,0 +1,167 @@
+# DRAFT firmware package for the Razer Edge Wi-Fi (nicole). Local use only.
+#
+# Razer/Qualcomm firmware is proprietary: it is NEVER downloaded from the internet and
+# NEVER uploaded anywhere (docs/guvenlik-kurallari.md §2, Seviye 4). This package only repackages a
+# LOCAL dump taken from the user's own device by scripts/faz0/03-firmware.sh.
+# Mapping and background: docs/firmware-listesi.md.
+#
+# Prepare the local source tarball INSIDE the build VM, next to this APKBUILD in the
+# pmbootstrap aports copy (not in the Mac project folder, which is git-tracked and full):
+#
+#   D="$(pmbootstrap config aports)/device/testing/firmware-razer-nicole"
+#   cd "<firmware dump dir, e.g. $YEDEK_KOK/firmware-YYYYmmdd-HHMMSS>"
+#   tar -cf "$D/nicole-firmware-dump.tar" \
+#       vendor/firmware_mnt/image/adsp.* vendor/firmware_mnt/image/cdsp.* \
+#       vendor/firmware_mnt/image/slpi.* vendor/firmware_mnt/image/*.jsn \
+#       vendor/firmware_mnt/image/qca6490 \
+#       vendor/firmware/a660_zap.* vendor/firmware/vpu20_4v.mbn \
+#       vendor/bt_firmware/image
+#   pmbootstrap checksum firmware-razer-nicole
+#
+# Then fill the TODO(cihaz) variables below from the device (docs/firmware-listesi.md §5-6).
+maintainer="Doruk Aktun <info@dorukaktun.com>"
+pkgname=firmware-razer-nicole
+pkgver=1
+pkgrel=0
+pkgdesc="Firmware for Razer Edge Wi-Fi (nicole) from a local device dump"
+url="https://postmarketos.org"
+arch="aarch64"
+license="proprietary"
+options="!check !strip !archcheck !tracedeps !spdx pmb:cross-native"
+makedepends="
+	linux-firmware-ath11k
+	pil-squasher
+	qca-swiss-army-knife
+	xz
+	zstd
+"
+subpackages="
+	$pkgname-adsp:adsp
+	$pkgname-cdsp:cdsp
+	$pkgname-slpi:slpi
+	$pkgname-gpu:gpu
+	$pkgname-venus:venus
+	$pkgname-wifi:wifi
+	$pkgname-bluetooth:bluetooth
+"
+source="nicole-firmware-dump.tar"
+builddir="$srcdir"
+
+# ---- TODO(cihaz): values that only the live device can provide --------------------
+# ath11k firmware dir: "hw1.1" (WCN6851, needs the 2026 WCN6851 patch series),
+# "hw2.0" or "hw2.1" (see dmesg: "Unsupported WCN6855 SOC hardware version: 1 16" etc.)
+_ath11k_hw="hw1.1"
+# Board data matching qmi-board-id: bdwlan.elf (0xff) or bdwlan.eXX / bdwlang.eXX
+_wlan_bdf="bdwlan.elf"
+# Exact name from ath11k's "failed to fetch board data for ..." message
+_wlan_board_name="bus=pci,vendor=17cb,device=1103,subsystem-vendor=TODO,subsystem-device=TODO,qmi-chip-id=TODO,qmi-board-id=TODO,variant=Razer_Nicole"
+# Main WLAN firmware on the device: amss.bin (major version 1) or amss20.bin (v2).
+# Only used for hw1.1 (hw2.x uses linux-firmware's amss.bin/m3.bin).
+_wlan_amss="amss.bin"
+# Bluetooth: rampatch + board specific NVM from /vendor/bt_firmware/image
+_bt_rampatch="hpbtfw10.tlv"
+_bt_nvm="hpnv10.bin"
+# -------------------------------------------------------------------------------------
+
+_fwdir="usr/lib/firmware/qcom/sm8350/razer/nicole"
+_img="vendor/firmware_mnt/image"
+
+# Uncompressed copy of linux-firmware's board-2.bin (Alpine may ship .zst/.xz).
+_upstream_board2() {
+	local b="/usr/lib/firmware/ath11k/WCN6855/hw2.0/board-2.bin"
+	if [ -f "$b" ]; then
+		cp "$b" "$1"
+	elif [ -f "$b.zst" ]; then
+		zstd -dqf "$b.zst" -o "$1"
+	elif [ -f "$b.xz" ]; then
+		xz -dc "$b.xz" > "$1"
+	else
+		return 1
+	fi
+}
+
+build() {
+	mkdir -p out/wlan
+
+	# Split PIL images (mdt + bNN) -> single signed mbn
+	local n
+	for n in adsp cdsp slpi; do
+		pil-squasher "out/$n.mbn" "$_img/$n.mdt"
+	done
+	pil-squasher out/a660_zap.mbn vendor/firmware/a660_zap.mdt
+	cp vendor/firmware/vpu20_4v.mbn out/vpu20_4v.mbn
+
+	# ath11k board-2.bin with the nicole entry built from the device's bdwlan file
+	cp "$_img/qca6490/$_wlan_bdf" out/wlan/bdf-nicole.bin
+	if [ "$_ath11k_hw" = "hw1.1" ]; then
+		cp "$_img/qca6490/regdb.bin" out/wlan/regdb.bin
+		cat > out/wlan/board-2.json <<-EOF
+		[{"board": [{"names": ["$_wlan_board_name"], "data": "bdf-nicole.bin"}],
+		  "regdb": [{"names": ["bus=pci"], "data": "regdb.bin"}]}]
+		EOF
+		(cd out/wlan && ath11k-bdencoder -c board-2.json -o board-2.bin)
+	else
+		_upstream_board2 out/wlan/board-2.bin || die "linux-firmware board-2.bin not found"
+		(cd out/wlan && ath11k-bdencoder -a board-2.bin bdf-nicole.bin "$_wlan_board_name")
+	fi
+	(cd out/wlan && ath11k-bdencoder -i board-2.bin | grep -F "variant=Razer_Nicole")
+}
+
+package() {
+	# Parent package stays empty; everything is in subpackages.
+	mkdir -p "$pkgdir"
+}
+
+adsp() {
+	pkgdesc="nicole ADSP firmware (battery/charger/USB-C via pmic_glink, audio)"
+	install -Dm644 "$builddir"/out/adsp.mbn -t "$subpkgdir/$_fwdir/"
+	# PD-mapper JSON files: not needed with CONFIG_QCOM_PD_MAPPER, kept for userspace pd-mapper
+	install -Dm644 "$builddir"/$_img/adsp*.jsn "$builddir"/$_img/battmgr.jsn \
+		-t "$subpkgdir/$_fwdir/" 2>/dev/null || true
+}
+
+cdsp() {
+	pkgdesc="nicole CDSP firmware"
+	install -Dm644 "$builddir"/out/cdsp.mbn -t "$subpkgdir/$_fwdir/"
+	install -Dm644 "$builddir"/$_img/cdsp*.jsn -t "$subpkgdir/$_fwdir/" 2>/dev/null || true
+}
+
+slpi() {
+	pkgdesc="nicole SLPI (sensor hub) firmware"
+	install -Dm644 "$builddir"/out/slpi.mbn -t "$subpkgdir/$_fwdir/"
+	install -Dm644 "$builddir"/$_img/slpi*.jsn -t "$subpkgdir/$_fwdir/" 2>/dev/null || true
+}
+
+gpu() {
+	pkgdesc="nicole Adreno 660 zap shader (OEM signed); SQE/GMU come from firmware-qcom-adreno-a660"
+	install -Dm644 "$builddir"/out/a660_zap.mbn -t "$subpkgdir/$_fwdir/"
+}
+
+venus() {
+	pkgdesc="nicole video (Iris/Venus VPU 2.0) firmware"
+	install -Dm644 "$builddir"/out/vpu20_4v.mbn -t "$subpkgdir/$_fwdir/"
+}
+
+wifi() {
+	pkgdesc="nicole ath11k board data (and hw1.1 firmware)"
+	local d="$subpkgdir/usr/lib/firmware/ath11k/WCN6855/$_ath11k_hw"
+	install -Dm644 "$builddir"/out/wlan/board-2.bin -t "$d/"
+	if [ "$_ath11k_hw" = "hw1.1" ]; then
+		# Not in linux-firmware: use the device's firmware
+		install -Dm644 "$builddir/$_img/qca6490/$_wlan_amss" "$d/amss.bin"
+		install -Dm644 "$builddir/$_img/qca6490/m3.bin" "$d/m3.bin"
+	else
+		# Overrides linux-firmware's board-2.bin (merged copy with our entry added)
+		replaces="linux-firmware-ath11k"
+	fi
+}
+
+bluetooth() {
+	pkgdesc="nicole Bluetooth NVM/rampatch (DT firmware-name = razer/nicole/...)"
+	local d="$subpkgdir/usr/lib/firmware/qca/razer/nicole"
+	install -Dm644 "$builddir/vendor/bt_firmware/image/$_bt_nvm" -t "$d/"
+	install -Dm644 "$builddir/vendor/bt_firmware/image/$_bt_rampatch" -t "$d/"
+}
+
+# Filled by: pmbootstrap checksum firmware-razer-nicole (after creating the local tar)
+sha512sums=""

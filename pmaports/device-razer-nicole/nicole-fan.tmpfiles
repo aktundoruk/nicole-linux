@@ -1,0 +1,7 @@
+# The fan profile is the screen user's choice (a settings app): group
+# plugdev may write it (the session user is in it). nicole-fan
+# reads one word every loop, an unknown word means dengeli, and the SoC, hottest-zone and
+# battery floors hold in every profile (full speed by 42 C skin at the latest).
+d /var/lib/nicole-fan 0755 root root -
+f /var/lib/nicole-fan/profil 0664 root plugdev - dengeli
+z /var/lib/nicole-fan/profil 0664 root plugdev -

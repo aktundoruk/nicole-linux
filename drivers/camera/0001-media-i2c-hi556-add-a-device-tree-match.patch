@@ -1,0 +1,45 @@
+From: Doruk Aktun <info@dorukaktun.com>
+Subject: [PATCH] media: i2c: hi556: add a device tree match
+
+The Hi-556 is also used on Qualcomm phones described by device tree (the
+Razer Edge's front camera, SM8350). Supplies and the reset GPIO are already
+looked up by name, so add the match table.
+
+The clock is requested by the name "clk", which only works on ACPI, where
+a fixed clock is registered for the sensor. A device tree node with a
+single clock has no clock-names, so look the clock up without a name, as
+the other single-clock sensor drivers do.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff --git a/drivers/media/i2c/hi556.c b/drivers/media/i2c/hi556.c
+index de573ce..8b9a77c 100644
+--- a/drivers/media/i2c/hi556.c
++++ b/drivers/media/i2c/hi556.c
+@@ -1341,7 +1341,7 @@ static int hi556_probe(struct i2c_client *client)
+ 		return dev_err_probe(hi556->dev, PTR_ERR(hi556->reset_gpio),
+ 				     "failed to get reset GPIO\n");
+ 
+-	hi556->clk = devm_v4l2_sensor_clk_get(hi556->dev, "clk");
++	hi556->clk = devm_v4l2_sensor_clk_get(hi556->dev, NULL);
+ 	if (IS_ERR(hi556->clk))
+ 		return dev_err_probe(hi556->dev, PTR_ERR(hi556->clk),
+ 				     "failed to get clock\n");
+@@ -1437,10 +1437,17 @@ static const struct acpi_device_id hi556_acpi_ids[] = {
+ MODULE_DEVICE_TABLE(acpi, hi556_acpi_ids);
+ #endif
+ 
++static const struct of_device_id hi556_of_match[] = {
++	{ .compatible = "hynix,hi556" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, hi556_of_match);
++
+ static struct i2c_driver hi556_i2c_driver = {
+ 	.driver = {
+ 		.name = "hi556",
+ 		.acpi_match_table = ACPI_PTR(hi556_acpi_ids),
++		.of_match_table = hi556_of_match,
+ 		.pm = pm_sleep_ptr(&hi556_pm_ops),
+ 	},
+ 	.probe = hi556_probe,

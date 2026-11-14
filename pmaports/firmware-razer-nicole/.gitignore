@@ -1,0 +1,5 @@
+# Proprietary device firmware dump: never commit (docs/guvenlik-kurallari.md §2, Seviye 4)
+*.tar
+*.tar.*
+vendor/
+out/

@@ -1,0 +1,314 @@
+# Reference: <https://postmarketos.org/devicepkg>
+#
+# DRAFT device package for the Razer Edge Wi-Fi (nicole, SG8175P / SM8350 family).
+# Local use only (not submitted anywhere). Based on device-sony-pdx215.
+# Copy this directory to "$(pmbootstrap config aports)/device/testing/" and run
+#   pmbootstrap checksum device-razer-nicole
+# to fill in sha512sums.
+#
+# Deliberately NOT depended on:
+#   soc-qcom-qbootctl  - marks A/B slots in the partition table; our images are only
+#                        RAM-booted and slot handling stays manual (docs/guvenlik-kurallari.md).
+#   soc-qcom-modem     - the Wi-Fi SKU has no usable modem (docs/firmware-listesi.md §2.4).
+maintainer="Doruk Aktun <info@dorukaktun.com>"
+pkgname=device-razer-nicole
+pkgdesc="Razer Edge Wi-Fi"
+pkgver=1
+pkgrel=32
+url="https://postmarketos.org"
+license="MIT"
+arch="aarch64"
+options="!check !archcheck"
+depends="
+	linux-razer-nicole
+	dtc
+	python3
+	mkbootimg
+	alsa-ucm-conf
+	alsa-utils
+	bluez
+	postmarketos-base
+	soc-qcom
+	hexagonrpcd
+	hexagonrpcd-systemd
+	hexagonrpcd-udev
+	hexagonrpcd-yazma
+	libssc
+	iio-sensor-proxy
+	iio-sensor-proxy-systemd
+	iio-sensor-proxy-udev
+	swclock-offset
+	e2fsprogs-extra
+	device-mapper
+	util-linux-misc
+"
+makedepends="devicepkg-dev gcc musl-dev linux-headers"
+# The speaker volume script (nicole-ses-seviye) moved here from nicole-kabuk
+replaces="nicole-kabuk"
+# Firmware is built from a LOCAL dump (firmware-razer-nicole), never downloaded.
+# Until Faz 0 has produced that dump the firmware-razer-nicole-* subpackages cannot
+# be built, so they are NOT recommended yet (the M1 image boots without firmware).
+# After Faz 0 add back: firmware-razer-nicole-adsp -cdsp -gpu -wifi -bluetooth
+_pmb_recommends="
+	firmware-qcom-adreno-a660
+	linux-firmware-qca
+"
+# modules-initfs lists only real modules: sdhci-msm, the HS USB PHY, dwc3(-qcom),
+# libcomposite and the NCM/ACM gadget functions are built in (=y in
+# scripts/build/razer.config) so even the mini initramfs gets USB networking.
+# nicole-fan: mainline max31760 is no cooling device, this loop drives the fan from
+# Razer's thermal trips + battery state (lab log, 25 Ekim; test:
+# scripts/test/nicole-fan-test.sh). Profiles sessiz/dengeli/performans change only the
+# skin table, read from /var/lib/nicole-fan/profil (docs/guvenlik-kurallari.md §8, 29 Ekim).
+# nicole-ses + ucm-*: ALSA UCM profile for the "Razer-Edge" card (speakers on PRI
+# MI2S, internal DMIC on the VA macro) and a oneshot that applies it at boot, as
+# no PipeWire session manager runs on this image (lab log, 28 Ekim). The
+# speaker amps also need aw88261_acf.bin (Razer's vendor aw882xx_acf.bin) in
+# /lib/firmware/qcom/sm8350/razer/nicole/: it comes from the local dump only and
+# is never packaged or published (docs/guvenlik-kurallari.md).
+# kernel-cmdline.conf: fw_devlink.sync_state=timeout because msm drives the GMU
+# without binding a driver to it, which would otherwise hold gcc/gpucc
+# sync_state() forever (unused GDSCs never off; lab log, 29 Ekim).
+# video=DSI-1:panel_orientation=normal: the console must not rotate the panel's plane;
+# sway does all rotation, whichever crtc the panel lands on (1 Kasım).
+# GPU zap shader (a660_zap.mbn) is Razer's: local only, never packaged.
+# nicole-uyku + nicole-uyku.conf: suspend is s2idle only, and the Wi-Fi endpoint must be off
+# the PCIe link while suspended or qcom-pcie's noirq suspend kills the phone (30 Ekim).
+# Note: systemd 262's sshd PAM session holds a "block" sleep inhibitor, so the phone does
+# not suspend while someone is logged in over ssh.
+# nicole-usb-rol + .rules: udev copies UCSI's USB-C data role into dwc3's role switch
+# (dr_mode otg in the DTS); pmic_glink connector@0 wired to dwc3 kept the link down (D1, 30 Ekim).
+# nicole-usb-gadget + .service + .rules: sets up the USB network gadget when the initramfs
+# found no UDC yet (dwc3 waits for the QMP PHY module since r9), same gadget as pmOS' (31 Ekim).
+# nicole-sensor.rules: start hexagonrpcd-sdsp when its node appears, it can lose the boot race.
+# nicole-sensor-denetle (+ .service, r31, 10 Kasım): iio-sensor-proxy started in the same second
+# as hexagonrpcd-sdsp found light and proximity but no accelerometer, so the screen never turned
+# that boot; it restarts the proxy until HasAccelerometer is true (6 tries, 15 s apart).
+# nicole-uyandi (r32): after a power key wake, turns the screen on if sway's binding did not
+# (started by the nicole-uyku hook via systemd-run; other wakes leave the screen off).
+# nicole-titresim.rules: uaccess on the aw8622x rumble device for the session user.
+# nicole-bekci + .files: returns to fastboot when the initramfs never reaches the root (5 Kasım).
+# kernel-cmdline.conf names it (rdinit=), so the cmdline and an initramfs built from this
+# package belong together: a boot image with rdinit= and an older initramfs panics.
+# nicole-imaj: boot images in the layout ABL boots, built on the phone from /boot (5 Kasım).
+# With --yaz it writes them to the running slot's own boot_x/vendor_boot_x (kernel updates
+# without a Mac, docs/guvenlik-kurallari.md §8 Faz 4, 8 Kasım): only when the write guard opens them and the new
+# cmdline opens them again; the old images are kept, --geri writes them back. Never runs by
+# itself (deviceinfo_flash_kernel_on_update stays false): the user runs it after apk upgrade.
+# nicole-bekci.yeniden on the cmdline (slot A only): restart instead of fastboot, so a bad
+# kernel uses up A's tries and ABL boots the rescue Linux in B.
+# nicole-a-onar: on the rescue slot B, mounts A's install and writes A's kept boot images
+# back (or builds new ones), so a kernel that never boots is repaired without a Mac
+# (docs/guvenlik-kurallari.md §8, 8 Kasım gece: B may write boot_a/vendor_boot_a; A never writes B).
+# nicole-slot (+ .service, .timer): 3 min after a healthy boot, puts the running slot's
+# boot tries back to 7 (the successful bit stays off, so 7 failed boots in a row still fall
+# back to the rescue slot). Writes the LUN 4 GPT, which also holds abl/tz/hyp: both copies
+# checked, one byte + CRCs, backup first; the kernel's write guard must open those blocks
+# (docs/guvenlik-kurallari.md §8 Faz 4; tested on the backup copy: 18 bytes change, sgdisk clean).
+# r29: ABL falls back to the other slot only when that one is marked successful (abl source,
+# HandleActiveSlotUnbootable), so on A it also keeps B successful (the rescue), and
+# "nicole-slot gec a|b" moves between slots by setting the two boot_x bytes so that ABL
+# itself switches at the next boot (scripts/test/nicole-slot-test.py: ABL model, 31 checks).
+# r30 (9 Kasım, settings app): nicole-slot tazele leaves both slots' bits in
+# /run/nicole-slot.durum (read only, for a settings app), and nicole-fan.tmpfiles
+# lets group plugdev (the screen user) write the fan profile.
+# nicole-saat (+ drop-ins, .rules, .service, .timer): the clock never goes back past the newest
+# saved time when the PMIC RTC was reset, and is set again once rtc-pm8xxx registered, because
+# the kernel then puts it back to the bare RTC (6 Kasım; test: scripts/test/nicole-saat-test.sh).
+# nicole-firmware-cek: copies the Razer/Qualcomm firmware from the phone's own Android
+# partitions (modem_b, dsp_b, super/vendor_b), all opened read-only, into the Linux root;
+# the files are never in this package (7 Kasım; verified: 156/156 files identical).
+# Wi-Fi: WCN6851 (= WCN6855 hw1.1, ath11k). linux-firmware has no hw1.1 files, so
+# /lib/firmware/ath11k/WCN6855/hw1.1/{amss,m3,regdb,board}.bin come from the
+# device's own modem partition (board.bin = bdwlan.elf, QMI board_id 0xff): local
+# dump only, never packaged (lab log, 29 Ekim). Bluetooth firmware
+# (qca/wcnhpbtfw10.tlv, wcnhpnv10.bin) is upstream, in linux-firmware-qca.
+source="
+	deviceinfo
+	kernel-cmdline.conf
+	modules-initfs
+	nicole-fan
+	nicole-fan.service
+	nicole-ses.service
+	ucm-HiFi.conf
+	ucm-Razer-Edge.conf
+	nicole-ses-seviye
+	hexagonrpcd-sdsp-yazma.conf
+	nicole-sensor.tmpfiles
+	nicole-fan.tmpfiles
+	nicole-sensor.preset
+	nicole-sensor.rules
+	nicole-sensor-denetle
+	nicole-sensor-denetle.service
+	nicole-uyku
+	nicole-uyandi
+	nicole-uyku.conf
+	nicole-usb-rol
+	nicole-usb-rol.rules
+	nicole-usb-gadget
+	nicole-usb-gadget.service
+	nicole-usb-gadget.rules
+	nicole-titresim.rules
+	nicole-bekci.c
+	nicole-bekci.files
+	nicole-imaj
+	nicole-a-onar
+	nicole-firmware-cek
+	nicole-saat
+	nicole-saat-boot.conf
+	nicole-saat-shutdown.conf
+	nicole-saat.rules
+	nicole-saat.service
+	nicole-saat.timer
+	nicole-slot
+	nicole-slot.service
+	nicole-slot.timer
+"
+
+build() {
+	devicepkg_build $startdir $pkgname
+	gcc -static -O2 -Wall -Wextra -o nicole-bekci "$srcdir"/nicole-bekci.c
+}
+
+package() {
+	devicepkg_package $startdir $pkgname
+
+	install -Dm755 "$srcdir"/nicole-fan "$pkgdir"/usr/sbin/nicole-fan
+	install -Dm644 "$srcdir"/nicole-fan.service \
+		"$pkgdir"/usr/lib/systemd/system/nicole-fan.service
+	mkdir -p "$pkgdir"/usr/lib/systemd/system/multi-user.target.wants
+	ln -s ../nicole-fan.service \
+		"$pkgdir"/usr/lib/systemd/system/multi-user.target.wants/nicole-fan.service
+
+	install -Dm644 "$srcdir"/ucm-Razer-Edge.conf \
+		"$pkgdir"/usr/share/alsa/ucm2/Razer/nicole/Razer-Edge.conf
+	install -Dm644 "$srcdir"/ucm-HiFi.conf \
+		"$pkgdir"/usr/share/alsa/ucm2/Razer/nicole/HiFi.conf
+	mkdir -p "$pkgdir"/usr/share/alsa/ucm2/conf.d/sm8250
+	ln -s ../../Razer/nicole/Razer-Edge.conf \
+		"$pkgdir"/usr/share/alsa/ucm2/conf.d/sm8250/Razer-Edge.conf
+	install -Dm644 "$srcdir"/nicole-ses.service \
+		"$pkgdir"/usr/lib/systemd/system/nicole-ses.service
+	ln -s ../nicole-ses.service \
+		"$pkgdir"/usr/lib/systemd/system/multi-user.target.wants/nicole-ses.service
+
+	install -Dm755 "$srcdir"/nicole-ses-seviye "$pkgdir"/usr/bin/nicole-ses-seviye
+
+	# Sensors (SLPI, 30 Ekim): hexagonrpcd serves /usr/share/qcom/sm8350/razer/nicole.
+	# The Razer files there (dsp/sdsp from the dsp partition, sensors/config and
+	# sensors/sns_reg.conf from vendor) and slpi.mbn come from the local dump only
+	# (scripts/lab/sensor-dosyalari.sh), never from this package. socinfo is what the
+	# DSP would read from Android's soc0 (mainline has no hw_platform): board-id
+	# 0x1001f 0x02 = HDK, subtype 2 ("hhg" sensor profiles).
+	local q="$pkgdir"/usr/share/qcom/sm8350/razer/nicole
+	mkdir -p "$q"/socinfo "$q"/sensors
+	echo HDK > "$q"/socinfo/hw_platform
+	echo HHG > "$q"/socinfo/platform_subtype
+	echo 2 > "$q"/socinfo/platform_subtype_id
+	echo 65536 > "$q"/socinfo/platform_version
+	echo 439 > "$q"/socinfo/soc_id
+	echo 2.1 > "$q"/socinfo/revision
+	ln -s /var/lib/hexagonrpcd/persist-sensors "$q"/sensors/persist
+	install -Dm644 "$srcdir"/hexagonrpcd-sdsp-yazma.conf \
+		"$pkgdir"/usr/lib/systemd/system/hexagonrpcd-sdsp.service.d/yazma.conf
+	install -Dm644 "$srcdir"/nicole-sensor.tmpfiles \
+		"$pkgdir"/usr/lib/tmpfiles.d/nicole-sensor.conf
+	install -Dm644 "$srcdir"/nicole-fan.tmpfiles \
+		"$pkgdir"/usr/lib/tmpfiles.d/nicole-fan.conf
+	install -Dm644 "$srcdir"/nicole-sensor.preset \
+		"$pkgdir"/usr/lib/systemd/system-preset/80-nicole-sensor.preset
+	install -Dm644 "$srcdir"/nicole-sensor.rules \
+		"$pkgdir"/usr/lib/udev/rules.d/90-nicole-sensor.rules
+	install -Dm755 "$srcdir"/nicole-sensor-denetle "$pkgdir"/usr/sbin/nicole-sensor-denetle
+	install -Dm644 "$srcdir"/nicole-sensor-denetle.service \
+		"$pkgdir"/usr/lib/systemd/system/nicole-sensor-denetle.service
+	ln -s ../nicole-sensor-denetle.service \
+		"$pkgdir"/usr/lib/systemd/system/multi-user.target.wants/nicole-sensor-denetle.service
+
+	install -Dm755 "$srcdir"/nicole-uyku "$pkgdir"/usr/lib/systemd/system-sleep/nicole-uyku
+	install -Dm755 "$srcdir"/nicole-uyandi "$pkgdir"/usr/libexec/nicole-uyandi
+	install -Dm644 "$srcdir"/nicole-uyku.conf \
+		"$pkgdir"/usr/lib/systemd/sleep.conf.d/nicole-uyku.conf
+
+	install -Dm755 "$srcdir"/nicole-usb-rol "$pkgdir"/usr/libexec/nicole-usb-rol
+	install -Dm644 "$srcdir"/nicole-usb-rol.rules \
+		"$pkgdir"/usr/lib/udev/rules.d/90-nicole-usb-rol.rules
+	install -Dm755 "$srcdir"/nicole-usb-gadget "$pkgdir"/usr/libexec/nicole-usb-gadget
+	install -Dm644 "$srcdir"/nicole-usb-gadget.service \
+		"$pkgdir"/usr/lib/systemd/system/nicole-usb-gadget.service
+	install -Dm644 "$srcdir"/nicole-usb-gadget.rules \
+		"$pkgdir"/usr/lib/udev/rules.d/90-nicole-usb-gadget.rules
+	install -Dm644 "$srcdir"/nicole-titresim.rules \
+		"$pkgdir"/usr/lib/udev/rules.d/73-nicole-titresim.rules
+	install -Dm755 "$srcdir"/nicole-imaj "$pkgdir"/usr/sbin/nicole-imaj
+	install -Dm755 "$srcdir"/nicole-a-onar "$pkgdir"/usr/sbin/nicole-a-onar
+	install -Dm755 "$srcdir"/nicole-firmware-cek "$pkgdir"/usr/sbin/nicole-firmware-cek
+	install -Dm755 nicole-bekci "$pkgdir"/usr/lib/nicole/nicole-bekci
+	install -Dm644 "$srcdir"/nicole-bekci.files \
+		"$pkgdir"/usr/share/mkinitfs/files/50-nicole-bekci.files
+
+	install -Dm755 "$srcdir"/nicole-saat "$pkgdir"/usr/libexec/nicole-saat
+	install -Dm644 "$srcdir"/nicole-saat-boot.conf \
+		"$pkgdir"/usr/lib/systemd/system/swclock-offset-boot.service.d/nicole-saat.conf
+	install -Dm644 "$srcdir"/nicole-saat-shutdown.conf \
+		"$pkgdir"/usr/lib/systemd/system/swclock-offset-shutdown.service.d/nicole-saat.conf
+	install -Dm644 "$srcdir"/nicole-saat.rules \
+		"$pkgdir"/usr/lib/udev/rules.d/90-nicole-saat.rules
+	install -Dm644 "$srcdir"/nicole-saat.service \
+		"$pkgdir"/usr/lib/systemd/system/nicole-saat.service
+	install -Dm644 "$srcdir"/nicole-saat.timer \
+		"$pkgdir"/usr/lib/systemd/system/nicole-saat.timer
+	mkdir -p "$pkgdir"/usr/lib/systemd/system/timers.target.wants
+	ln -s ../nicole-saat.timer \
+		"$pkgdir"/usr/lib/systemd/system/timers.target.wants/nicole-saat.timer
+	install -Dm755 "$srcdir"/nicole-slot "$pkgdir"/usr/sbin/nicole-slot
+	install -Dm644 "$srcdir"/nicole-slot.service \
+		"$pkgdir"/usr/lib/systemd/system/nicole-slot.service
+	install -Dm644 "$srcdir"/nicole-slot.timer \
+		"$pkgdir"/usr/lib/systemd/system/nicole-slot.timer
+	ln -s ../nicole-slot.timer \
+		"$pkgdir"/usr/lib/systemd/system/timers.target.wants/nicole-slot.timer
+}
+
+# Filled by: pmbootstrap checksum device-razer-nicole
+sha512sums="
+f66edc5fd1e1c3c477315f2bb4e002988a54bb4fbcb4195ac1fc380e6c19ce2ca4aa368dd4c8568f31e52cdfeaf1a8cfb43156605948afbde8ff401c8aa1a43b  deviceinfo
+9f1857f23f1e32e3b0f7756b59c2e794f38625d7e48e9c134660b846c223bbd50ddb7ee46e577b90b4018933edc0b43d2021bfa79b317cc4492cc74c5c8e62ba  kernel-cmdline.conf
+40e6c7698ab37f2f059693fb48df51fed985dd1a12ab519da45daa66ddcb7c409fa973d4e70c15540ae3833f5c6d32891c5e90e640e7d8bc5ab86b2350beee79  modules-initfs
+f3577f9602ef07c7df14c3028912fb60fbb9ab39133aec5b903698a25b5523244d853c3aa9df140ee5ee62c5299f1122e5485f8033bee0eaef681739893b3d86  nicole-fan
+4d4a5b1169883cf497f0209837d12cf90390cdc99d0d8437a3e5b7beaa5cca242d8907843496700d17bfb57eeb4397ed899668682ea4308aaa5762a72fc97c35  nicole-fan.service
+0f3f132b0b871fd9dc15d4e8ad3b26bd99d966a9541d6fa943bd708f6421fd399f652432e13d0c6cd311fe2655dc2e06159146c39bb97fbe971d7a32ab58e5e5  nicole-ses.service
+cf586afc8b617a2d055311c4f7bb57015121081c9dbd922c0500d70384614c8dd98cd1b9eedff2b62e8ba99fb5f4bd041408c36b92c08a923c2b6b553ab20ccf  ucm-HiFi.conf
+2ace52d20adb6a581d2c297f5dfeccf33277e1f774ab66f93d912f62f4cb102922d83a355cbe536a20589072d11480c5fa7d9623ae5dfb7b208da329f48daaaf  ucm-Razer-Edge.conf
+2f17c2638de64178d7eea82a905d88091f6519e4ad798128329c6ee5e484baa826060dc453984bf94c040ea16ee0cd4508688c6e73f6ce98fe1d2ebe40754455  nicole-ses-seviye
+e81bdec73d36cbb12fe3c8f65da5cbd2416e626e3418454041c920f2599664df9af127ccf285cd6a677caa1e1a7f94ea022a951413eaa25640b772cdb1bcc398  hexagonrpcd-sdsp-yazma.conf
+b8fc40eb489b7cab691c770c8bb17bdb984b880238f392ff1696d29fc34e436ab082f55840b0af786ac306e10deccc6bf31a0a9640f0ef5ab37141d7e8f5daef  nicole-sensor.tmpfiles
+f0a68e232333e8c24b256288a54b01489c4a31014e482b9512c9e593654b12c2f324f3eb4cc71475f2a9f592264dad1cd3122838f885a1ad04407928b29afbc4  nicole-fan.tmpfiles
+eb9e290124b70585f566372d73a31cd600103d5abf6db236255022765feecf3374b94f75df5010e06811e5b33d01ff442fcabc7ec602dca98f8a84086a951f94  nicole-sensor.preset
+39dabe28c6b79a5568b5bb922514bdc62e593b7933b0bc6d855ca5e265c9734b80a031bc6eb0ac8bb6ba2a945db1852cfc0e4bc1606c54ff46f9a9c8daa715ed  nicole-sensor.rules
+8619ade8d7074a30503b0b72d5f6824ed704ea9275666486bb3d5a5f1f587bf731f4893815aa29acbe2a6c939ef139c4f3e540374405d095ae5ef00031f1ab6c  nicole-sensor-denetle
+87278d3b1f47e2067cdbc37f806a945507672d506083d5ac46b75cdb6ab7834ce1c622fec4fc79b8db54c868b12e53832524f137ce575f6a165023b29d1811c1  nicole-sensor-denetle.service
+7656712cc6e1040130ca3abfa47120a7ee35c09584d86b0784198f76cb9f264a0dba5cb3e1aad648cffe5a77d03f7ed65eae532a559fa2bfe7a30e056c4a39c7  nicole-uyku
+0fc91434d2696762d2c8de97a4a1b0b2432aa64e6d71df84e158d3af4dd05c91f17e8e50f12a187d8977eda158e91cdeed2b6c3907eaa3979639534aba73c2c5  nicole-uyandi
+7fcf1c5dfabcdab80a0304c20bd6c8d07ebe785ffc043f6e076ff31630334b9f8a1b68900527db3ae026fa02d8e37a219613a76b5d359c6db5cfb3d8d76dc1a3  nicole-uyku.conf
+6ac6d2de2971ad575b79d35030547c27f2a21b6a65bb5d8e485a83db9910299d6b10d76169fc778cb8d9992d5e942eb4f5b8e4a7226f30b90d4742d3f853e74c  nicole-usb-rol
+aea68c2ba9f0237f30018577dd0ba7cea15ae4e7ffb377a85882b75da07c19a6678ac428abfb3cbb24858a836f67aa478c5974b04c03cbbe0e73bfa7dc05bc23  nicole-usb-rol.rules
+7bb264e0f00e5bea78c61c3de78ef7d110323d90e24cf5ed890306f8d6ea659c9c649a3b6317cf6b4fbbbb444caf36298c5d144a7239cc5fe40979b065a3e668  nicole-usb-gadget
+756bc774968ddbe1629e08d130bccc631cd9daf952f1e412b6e6c0b3744a115ffb1a4801da895c212877ea725f37a51386192925680f91ccada48658e4147146  nicole-usb-gadget.service
+75b8b2f3335c0a3d2fca8139860f65fafd50673444bdd838774f528557a8f3e8d241b428835412d401b74179c82825c399804148e36c3fcdd0c44ea089d39e86  nicole-usb-gadget.rules
+c426fb0342f9139552aa2082a732d4f06f08d1ed370e58d89bd2b915f5a2701f38739f9cc914034b33cceab6f7259016244de1faa283005491dc9ff5a044955e  nicole-titresim.rules
+5bdc62c128cefa13f59f689c7a5d4caf3e01a4b54fdf85eeeb1ed69ccbb57b119ac43016ecaa16a14be91b3ca662620366841884dd52c0847600cb13c0494968  nicole-bekci.c
+8d1fed6409b00b31101690867419f99a088524ac15c0896b8b753387d7d4eb39988ade345a2e4ddd8b3a69ce793c05040e6a3ef12edf4266605229712ebe7ea1  nicole-bekci.files
+6fde74e34aefabd8cb2211d89aed5152b842796d24184703e0ce9d9183f2c3a3845d4b71c1ba3e1414c7bf3333afab5e147cb6b24385d1e32ee47fc458a37aa3  nicole-imaj
+3f81472a05b192d33970cbf870a5601c864cd2c9a9e0715a9bb71621928bbcdec4baea67f862bf123d3d2f1f7405d73f925b00392babdc56ab882cd4d58b4066  nicole-a-onar
+8ca5eb6833f233fc50762df9b42299ebbbeb814eabd7dcd3c4743024eb77e7584593ed4ba11fc09b01a97062e9b5e9ffe505f7c5b0d0cbdeb56f5bc86ae94c1f  nicole-firmware-cek
+8731ad7a2ce5ba7f9a035460d94caef020116b8607056d6cfd3a0e3a514d7c80cb3aebb41ac5ce8b3103e1097c516c98f060049ce792d8ec9389ecb36464ef50  nicole-saat
+a3b99aa53f2b26c3d2eeae7f643e0ef83422944e39844e6cf1e62999c2d600d94eb27d9e3e96a33967aa3542f929239018aa276d506d39a6b6c369365f794814  nicole-saat-boot.conf
+e5e511a97625b1f3a503357d3c2a5ab5c95e2f643e8899b719f7aa45904e2a93b133fa0ecbca81661862ffbc633d1c35f80c93679515ac28cd93c12175a90e8c  nicole-saat-shutdown.conf
+e281c2427296ca4513f18214fca2134c96e8128b0b6e00bd431e8570e88b9d105d705cc44b44cf7adad3dfbe8740cfd011123c3af8b9c1a7aa83a4d5de15f1c5  nicole-saat.rules
+a1b24d777f6bb2dbd8c3bd9fae6f85de45e147c74510bc922f00e68995fb5eef41a1dca92d29543d77474316f2d9fcdfb332568fab880bfd9469d784d71f1405  nicole-saat.service
+82111b1507ca252c1828a5a2bfb9e10e9b6da98705b69a8756af00e02c986bcf41b1068be1f5ffa6be9019a5cb9027fb68688d91a84d5322dbc132c82a4b52a5  nicole-saat.timer
+aacc642fc374818d9e529990d51fa59aa32c85960642677d63d098f813d2c531cae63951815ea38fbc13b03dc02f85ddc2b554252d23faa4039d94f15e8a7baf  nicole-slot
+933e7e19d8d31587f4a079c00f5a52750d81535a72d47132998db5e79640f664f528e854adc84221c6f2946acf41572b01ad347a6ef4e5f24a99992f6e69e159  nicole-slot.service
+6f8e57c306f1a53f1f8ed63466ee8d3253f1bffd80481f011f800f22c413e4bb36a4de5bf8787685e7220f5f87cec6f696615f5d013a6c12663aa2ca3464091a  nicole-slot.timer
+"

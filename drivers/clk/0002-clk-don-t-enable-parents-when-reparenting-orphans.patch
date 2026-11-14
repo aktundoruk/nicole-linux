@@ -1,0 +1,74 @@
+From: Doruk Aktun <info@dorukaktun.com>
+Subject: [PATCH] clk: Don't enable parents when reparenting orphans
+
+clk_core_reparent_orphans_nolock() uses __clk_set_parent_before() and
+__clk_set_parent_after() to migrate the prepare/enable count of an
+orphan. For a CLK_OPS_PARENT_ENABLE orphan these also prepare and
+enable the new parent around the reparent, but no clk_ops is called on
+the orphan here, so there is nothing that needs the parent running.
+
+It also goes wrong when the new parent cannot be enabled yet. On SM8350
+the DSI PHY registers its PLL outputs and the display clock controller's
+pixel clock sources (CLK_OPS_PARENT_ENABLE) are reparented to them in
+of_clk_add_hw_provider(). The PLL has no rate yet and fails to lock, the
+error of clk_core_prepare_enable() is ignored, and
+__clk_set_parent_after() then disables and unprepares a parent that was
+never enabled:
+
+  DSI PLL(0) lock failed, status=0x00000000
+  dsi0_phy_pll_out_dsiclk already disabled
+  WARNING: drivers/clk/clk.c:1257 at clk_core_disable+0x288/0x2c0
+  dsi0_phy_pll_out_dsiclk already unprepared
+  WARNING: drivers/clk/clk.c:1116 at clk_core_unprepare+0x2e8/0x320
+
+Only migrate the prepare/enable count when reparenting orphans.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff --git a/drivers/clk/clk.c b/drivers/clk/clk.c
+index fef87167a..e54b71aba 100644
+--- a/drivers/clk/clk.c
++++ b/drivers/clk/clk.c
+@@ -3935,15 +3935,36 @@ static void clk_core_reparent_orphans_nolock(void)
+ 		struct clk_core *parent = __clk_init_parent(orphan);
+ 
+ 		/*
+-		 * We need to use __clk_set_parent_before() and _after() to
+-		 * properly migrate any prepare/enable count of the orphan
+-		 * clock. This is important for CLK_IS_CRITICAL clocks, which
+-		 * are enabled during init but might not have a parent yet.
++		 * Migrate any prepare/enable count of the orphan clock to its
++		 * new parent. This is important for CLK_IS_CRITICAL clocks,
++		 * which are enabled during init but might not have a parent
++		 * yet.
++		 *
++		 * This only updates the topology, no clk_ops is called on the
++		 * orphan, so CLK_OPS_PARENT_ENABLE does not apply here. Doing
++		 * the parent enable dance of __clk_set_parent_before() anyway
++		 * is not only useless: if the new parent cannot be enabled yet
++		 * (e.g. an unconfigured PLL that fails to lock), the failure is
++		 * ignored and __clk_set_parent_after() then disables and
++		 * unprepares a parent that was never enabled, triggering the
++		 * "already disabled" and "already unprepared" warnings.
+ 		 */
+ 		if (parent) {
++			unsigned long flags;
++
++			if (orphan->prepare_count) {
++				clk_core_prepare_enable(parent);
++				clk_core_enable_lock(orphan);
++			}
++
+ 			/* update the clk tree topology */
+-			__clk_set_parent_before(orphan, parent);
+-			__clk_set_parent_after(orphan, parent, NULL);
++			flags = clk_enable_lock();
++			clk_reparent(orphan, parent);
++			clk_enable_unlock(flags);
++
++			if (orphan->prepare_count)
++				clk_core_disable_lock(orphan);
++
+ 			__clk_recalc_accuracies(orphan);
+ 			__clk_recalc_rates(orphan, true, 0);
+ 

@@ -1,0 +1,526 @@
+From: Razer Edge port draft
+Subject: [PATCH] drm/panel: visionox-vtdr6130: add Razer Edge (nicole) command mode variant
+
+The Razer Edge Wi-Fi (SM8350, "nicole") uses a Visionox VTDR6130 module
+driven in DSI command mode with DSC (2 slices of 540x20, 8bpc, 8bpp),
+whereas the existing driver drives the SM8550 HDK/QRD module in video mode.
+The vendor init sequence also differs (0x6f = 0x02 for command mode,
+module specific tuning on pages 0x10/0x12/0x15), the board has no 1.2V
+VDD rail but a GPIO switched panel power rail, the reset pulse is longer
+and the vendor caps the brightness at 2047.
+
+Introduce a per-compatible description and add the
+"visionox,vtdr6130-razer-nicole" variant. Also honour the panel-common
+"rotation" property, as the panel is mounted upside down on this device.
+
+Only the 144Hz mode is exposed for now.
+
+Draft, untested on hardware.
+---
+--- a/Documentation/devicetree/bindings/display/panel/visionox,vtdr6130.yaml	2026-10-05 07:39:13
++++ b/Documentation/devicetree/bindings/display/panel/visionox,vtdr6130.yaml	2026-10-05 07:44:43
+@@ -14,7 +14,10 @@
+ 
+ properties:
+   compatible:
+-    const: visionox,vtdr6130
++    enum:
++      - visionox,vtdr6130
++      # Command mode module used in the Razer Edge (nicole) handheld
++      - visionox,vtdr6130-razer-nicole
+ 
+   reg:
+     maxItems: 1
+@@ -23,18 +26,36 @@
+   vddio-supply: true
+   vci-supply: true
+   vdd-supply: true
++  avdd-supply:
++    description: Switched panel power rail (Razer Edge only)
+   port: true
+   reset-gpios: true
++  rotation: true
+ 
+ required:
+   - compatible
+   - reg
+   - vddio-supply
+   - vci-supply
+-  - vdd-supply
+   - reset-gpios
+   - port
+ 
++if:
++  properties:
++    compatible:
++      contains:
++        const: visionox,vtdr6130-razer-nicole
++then:
++  required:
++    - avdd-supply
++  properties:
++    vdd-supply: false
++else:
++  required:
++    - vdd-supply
++  properties:
++    avdd-supply: false
++
+ additionalProperties: false
+ 
+ examples:
+--- a/drivers/gpu/drm/panel/panel-visionox-vtdr6130.c	2026-10-05 07:39:13
++++ b/drivers/gpu/drm/panel/panel-visionox-vtdr6130.c	2026-10-05 07:42:53
+@@ -7,21 +7,56 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/property.h>
+ 
+ #include <drm/display/drm_dsc.h>
+ #include <drm/display/drm_dsc_helper.h>
+ #include <drm/drm_mipi_dsi.h>
+ #include <drm/drm_modes.h>
++#include <drm/drm_of.h>
+ #include <drm/drm_panel.h>
+ 
+ #include <video/mipi_display.h>
+ 
++struct visionox_vtdr6130;
++
++/**
++ * struct visionox_vtdr6130_desc - per-integration description
++ * @mode: the single display mode exposed by this variant
++ * @supplies: regulator names, in power-on order
++ * @num_supplies: number of entries in @supplies
++ * @supply_on_delay_ms: optional per-supply delay after enabling it; when
++ *	NULL all supplies are enabled at once with regulator_bulk_enable()
++ * @reset_assert_ms: time the reset line is held asserted
++ * @reset_post_ms: time to wait after releasing reset
++ * @mode_flags: DSI mode flags (video vs. command mode, ...)
++ * @dsc_version_minor: DSC minor version advertised in the PPS
++ * @dsc_slice_height: DSC slice height
++ * @max_brightness: maximum value of the 0x51 brightness register
++ * @on: panel initialisation sequence
++ */
++struct visionox_vtdr6130_desc {
++	const struct drm_display_mode *mode;
++	const struct regulator_bulk_data *supplies;
++	unsigned int num_supplies;
++	const unsigned int *supply_on_delay_ms;
++	unsigned int reset_assert_ms;
++	unsigned int reset_post_ms;
++	unsigned long mode_flags;
++	u8 dsc_version_minor;
++	u16 dsc_slice_height;
++	u16 max_brightness;
++	int (*on)(struct visionox_vtdr6130 *ctx);
++};
++
+ struct visionox_vtdr6130 {
+ 	struct drm_panel panel;
+ 	struct drm_dsc_config dsc;
+ 	struct mipi_dsi_device *dsi;
+ 	struct gpio_desc *reset_gpio;
+ 	struct regulator_bulk_data *supplies;
++	const struct visionox_vtdr6130_desc *desc;
++	enum drm_panel_orientation orientation;
+ };
+ 
+ static const struct regulator_bulk_data visionox_vtdr6130_supplies[] = {
+@@ -30,6 +65,22 @@
+ 	{ .supply = "vdd" },
+ };
+ 
++/*
++ * On the Razer Edge (nicole) there is no separate 1.2V VDD rail: the board
++ * provides VDDIO (1.86V), VCI (3.0V) and a GPIO-switched panel power rail
++ * ("avdd" in the vendor tree). Downstream enables them in this order and
++ * waits 20ms after VDDIO.
++ */
++static const struct regulator_bulk_data visionox_vtdr6130_nicole_supplies[] = {
++	{ .supply = "vddio" },
++	{ .supply = "vci" },
++	{ .supply = "avdd" },
++};
++
++static const unsigned int visionox_vtdr6130_nicole_supply_delays[] = {
++	20, 0, 0,
++};
++
+ static inline struct visionox_vtdr6130 *to_visionox_vtdr6130(struct drm_panel *panel)
+ {
+ 	return container_of(panel, struct visionox_vtdr6130, panel);
+@@ -37,14 +88,56 @@
+ 
+ static void visionox_vtdr6130_reset(struct visionox_vtdr6130 *ctx)
+ {
++	const struct visionox_vtdr6130_desc *desc = ctx->desc;
++
+ 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+ 	usleep_range(10000, 11000);
+ 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+-	usleep_range(10000, 11000);
++	fsleep(desc->reset_assert_ms * USEC_PER_MSEC);
+ 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+-	usleep_range(10000, 11000);
++	fsleep(desc->reset_post_ms * USEC_PER_MSEC);
+ }
+ 
++static int visionox_vtdr6130_power_on(struct visionox_vtdr6130 *ctx)
++{
++	const struct visionox_vtdr6130_desc *desc = ctx->desc;
++	unsigned int i;
++	int ret;
++
++	if (!desc->supply_on_delay_ms)
++		return regulator_bulk_enable(desc->num_supplies, ctx->supplies);
++
++	for (i = 0; i < desc->num_supplies; i++) {
++		ret = regulator_enable(ctx->supplies[i].consumer);
++		if (ret) {
++			while (i--)
++				regulator_disable(ctx->supplies[i].consumer);
++			return ret;
++		}
++
++		if (desc->supply_on_delay_ms[i])
++			msleep(desc->supply_on_delay_ms[i]);
++	}
++
++	return 0;
++}
++
++static void visionox_vtdr6130_power_off(struct visionox_vtdr6130 *ctx)
++{
++	const struct visionox_vtdr6130_desc *desc = ctx->desc;
++	unsigned int i;
++
++	if (!desc->supply_on_delay_ms) {
++		regulator_bulk_disable(desc->num_supplies, ctx->supplies);
++		return;
++	}
++
++	for (i = desc->num_supplies; i > 0; i--) {
++		regulator_disable(ctx->supplies[i - 1].consumer);
++		usleep_range(2000, 3000);
++	}
++}
++
+ static int visionox_vtdr6130_on(struct visionox_vtdr6130 *ctx)
+ {
+ 	struct mipi_dsi_device *dsi = ctx->dsi;
+@@ -134,6 +227,111 @@
+ 	return dsi_ctx.accum_err;
+ }
+ 
++/*
++ * Command mode init sequence used by the Razer Edge (nicole) Android
++ * kernel, 144Hz timing (timing@3 of
++ * dsi-panel-vtdr6130-dsc-fhd-plus-144hz-cmd.dtsi). It differs from the
++ * sequence above in 0x6f (0x02 = command mode interface), in the module
++ * specific tuning on pages 0x10/0x12/0x15 and in the missing trailing
++ * 0xf9/0xf8/0xf4 writes.
++ */
++static int visionox_vtdr6130_nicole_on(struct visionox_vtdr6130 *ctx)
++{
++	struct mipi_dsi_device *dsi = ctx->dsi;
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
++	struct drm_dsc_picture_parameter_set pps;
++
++	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x03, 0x01);
++
++	mipi_dsi_dcs_set_tear_on_multi(&dsi_ctx, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
++
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,
++				     MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x20);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,
++				     MIPI_DCS_SET_DISPLAY_BRIGHTNESS, 0x07,
++				     0xff);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x59, 0x09);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6c, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6d, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x02);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x70, 0x12, 0x00, 0x00, 0xab,
++				     0x30, 0x80, 0x09, 0x60, 0x04, 0x38, 0x00,
++				     0x28, 0x02, 0x1c, 0x02, 0x1c, 0x02, 0x00,
++				     0x02, 0x0e, 0x00, 0x20, 0x03, 0xdd, 0x00,
++				     0x07, 0x00, 0x0c, 0x02, 0x77, 0x02, 0x8b,
++				     0x18, 0x00, 0x10, 0xf0, 0x07, 0x10, 0x20,
++				     0x00, 0x06, 0x0f, 0x0f, 0x33, 0x0e, 0x1c,
++				     0x2a, 0x38, 0x46, 0x54, 0x62, 0x69, 0x70,
++				     0x77, 0x79, 0x7b, 0x7d, 0x7e, 0x02, 0x02,
++				     0x22, 0x00, 0x2a, 0x40, 0x2a, 0xbe, 0x3a,
++				     0xfc, 0x3a, 0xfa, 0x3a, 0xf8, 0x3b, 0x38,
++				     0x3b, 0x78, 0x3b, 0xb6, 0x4b, 0xb6, 0x4b,
++				     0xf4, 0x4b, 0xf4, 0x6c, 0x34, 0x84, 0x74,
++				     0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x10);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb3, 0xc6);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc3, 0x44);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd0, 0x84, 0x15, 0x50, 0x14,
++				     0x14, 0x00, 0x35, 0x48, 0x1f, 0x4f, 0x1f,
++				     0x00, 0x48, 0x1f, 0x50, 0x00, 0x00, 0x00,
++				     0x05, 0x05);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x12);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc7, 0x2e, 0x73, 0x32, 0x74);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x14);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb2, 0x03, 0x33);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb4, 0x00, 0x33, 0x00, 0x00,
++				     0x00, 0x3e, 0x00, 0x00, 0x00, 0x3e, 0x00,
++				     0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb5, 0x00, 0x09, 0x09, 0x09,
++				     0x09, 0x09, 0x09, 0x06, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x00, 0x00, 0x08, 0x09,
++				     0x09, 0x09);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbc, 0x10, 0x00, 0x00, 0x06,
++				     0x11, 0x09, 0x3b, 0x09, 0x47, 0x09, 0x47,
++				     0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbe, 0x10, 0x10, 0x00, 0x08,
++				     0x22, 0x09, 0x19, 0x09, 0x25, 0x09, 0x25,
++				     0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x15);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbe, 0x22, 0x44, 0x22, 0x22,
++				     0x11, 0x11, 0x44, 0x44, 0x44, 0x44, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x22);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x5a, 0x80);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x65, 0x14);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfa, 0x08, 0x08, 0x08);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x5a, 0x81);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x65, 0x05);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf3, 0x0f);
++
++	/* 144Hz: 0x6c = 0x01 selects the 120/144Hz group, B1/CE pick 144Hz */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6c, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x10);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1, 0x01, 0x38, 0x00, 0x14,
++				     0x00, 0x1c, 0x00, 0x01, 0x66, 0x00, 0x14,
++				     0x00, 0x14, 0x00, 0x01, 0x66, 0x00, 0x14,
++				     0x05, 0xcc, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x13);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xce, 0x09, 0x11, 0x09, 0x11,
++				     0x08, 0xc1, 0x07, 0xfa, 0x05, 0xa4, 0x00,
++				     0x3c, 0x00, 0x34, 0x00, 0x24, 0x00, 0x0c,
++				     0x00, 0x0c, 0x04, 0x00, 0x35);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x5a, 0x00);
++
++	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 120);
++
++	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 20);
++
++	drm_dsc_pps_payload_pack(&pps, dsi->dsc);
++	mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
++
++	return dsi_ctx.accum_err;
++}
++
+ static void visionox_vtdr6130_off(struct visionox_vtdr6130 *ctx)
+ {
+ 	struct mipi_dsi_device *dsi = ctx->dsi;
+@@ -153,18 +351,16 @@
+ 	struct visionox_vtdr6130 *ctx = to_visionox_vtdr6130(panel);
+ 	int ret;
+ 
+-	ret = regulator_bulk_enable(ARRAY_SIZE(visionox_vtdr6130_supplies),
+-				    ctx->supplies);
++	ret = visionox_vtdr6130_power_on(ctx);
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	visionox_vtdr6130_reset(ctx);
+ 
+-	ret = visionox_vtdr6130_on(ctx);
++	ret = ctx->desc->on(ctx);
+ 	if (ret < 0) {
+ 		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+-		regulator_bulk_disable(ARRAY_SIZE(visionox_vtdr6130_supplies),
+-				       ctx->supplies);
++		visionox_vtdr6130_power_off(ctx);
+ 		return ret;
+ 	}
+ 
+@@ -179,8 +375,7 @@
+ 
+ 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+ 
+-	regulator_bulk_disable(ARRAY_SIZE(visionox_vtdr6130_supplies),
+-			       ctx->supplies);
++	visionox_vtdr6130_power_off(ctx);
+ 
+ 	return 0;
+ }
+@@ -199,12 +394,34 @@
+ 	.height_mm = 157,
+ };
+ 
++/*
++ * Razer Edge timings: all four vendor modes (60/90/120/144Hz) share the same
++ * pixel clock and only differ in the vertical front porch (3436/1484/508/20).
++ * Only the 144Hz mode is exposed for now, as the init sequence programs the
++ * panel's internal refresh rate and the panel API does not tell us which mode
++ * was picked at prepare time.
++ */
++static const struct drm_display_mode visionox_vtdr6130_nicole_mode = {
++	.clock = (1080 + 20 + 4 + 20) * (2400 + 20 + 4 + 16) * 144 / 1000,
++	.hdisplay = 1080,
++	.hsync_start = 1080 + 20,
++	.hsync_end = 1080 + 20 + 4,
++	.htotal = 1080 + 20 + 4 + 20,
++	.vdisplay = 2400,
++	.vsync_start = 2400 + 20,
++	.vsync_end = 2400 + 20 + 4,
++	.vtotal = 2400 + 20 + 4 + 16,
++	.width_mm = 71,
++	.height_mm = 158,
++};
++
+ static int visionox_vtdr6130_get_modes(struct drm_panel *panel,
+ 				       struct drm_connector *connector)
+ {
++	struct visionox_vtdr6130 *ctx = to_visionox_vtdr6130(panel);
+ 	struct drm_display_mode *mode;
+ 
+-	mode = drm_mode_duplicate(connector->dev, &visionox_vtdr6130_mode);
++	mode = drm_mode_duplicate(connector->dev, ctx->desc->mode);
+ 	if (!mode)
+ 		return -ENOMEM;
+ 
+@@ -218,10 +435,19 @@
+ 	return 1;
+ }
+ 
++static enum drm_panel_orientation
++visionox_vtdr6130_get_orientation(struct drm_panel *panel)
++{
++	struct visionox_vtdr6130 *ctx = to_visionox_vtdr6130(panel);
++
++	return ctx->orientation;
++}
++
+ static const struct drm_panel_funcs visionox_vtdr6130_panel_funcs = {
+ 	.prepare = visionox_vtdr6130_prepare,
+ 	.unprepare = visionox_vtdr6130_unprepare,
+ 	.get_modes = visionox_vtdr6130_get_modes,
++	.get_orientation = visionox_vtdr6130_get_orientation,
+ };
+ 
+ static int visionox_vtdr6130_bl_update_status(struct backlight_device *bl)
+@@ -237,13 +463,14 @@
+ };
+ 
+ static struct backlight_device *
+-visionox_vtdr6130_create_backlight(struct mipi_dsi_device *dsi)
++visionox_vtdr6130_create_backlight(struct mipi_dsi_device *dsi,
++				   u16 max_brightness)
+ {
+ 	struct device *dev = &dsi->dev;
+ 	const struct backlight_properties props = {
+ 		.type = BACKLIGHT_RAW,
+-		.brightness = 4095,
+-		.max_brightness = 4095,
++		.brightness = max_brightness,
++		.max_brightness = max_brightness,
+ 	};
+ 
+ 	return devm_backlight_device_register(dev, dev_name(dev), dev, dsi,
+@@ -262,9 +489,13 @@
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 
++	ctx->desc = device_get_match_data(dev);
++	if (!ctx->desc)
++		return -ENODEV;
++
+ 	ret = devm_regulator_bulk_get_const(&dsi->dev,
+-					    ARRAY_SIZE(visionox_vtdr6130_supplies),
+-					    visionox_vtdr6130_supplies,
++					    ctx->desc->num_supplies,
++					    ctx->desc->supplies,
+ 					    &ctx->supplies);
+ 	if (ret < 0)
+ 		return ret;
+@@ -274,12 +505,16 @@
+ 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
+ 				     "Failed to get reset-gpios\n");
+ 
++	ret = drm_of_get_panel_orientation(dev->of_node, &ctx->orientation);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "Failed to get orientation\n");
++
+ 	ctx->dsi = dsi;
+ 	mipi_dsi_set_drvdata(dsi, ctx);
+ 
+ 	ctx->dsc.dsc_version_major = 0x1;
+-	ctx->dsc.dsc_version_minor = 0x2;
+-	ctx->dsc.slice_height = 40;
++	ctx->dsc.dsc_version_minor = ctx->desc->dsc_version_minor;
++	ctx->dsc.slice_height = ctx->desc->dsc_slice_height;
+ 	ctx->dsc.slice_width = 540;
+ 	ctx->dsc.slice_count = 2;
+ 	ctx->dsc.bits_per_component = 8;
+@@ -289,11 +524,12 @@
+ 	dsi->dsc = &ctx->dsc;
+ 	dsi->lanes = 4;
+ 	dsi->format = MIPI_DSI_FMT_RGB888;
+-	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_NO_EOT_PACKET |
+-			  MIPI_DSI_CLOCK_NON_CONTINUOUS;
++	dsi->mode_flags = ctx->desc->mode_flags;
+ 	ctx->panel.prepare_prev_first = true;
+ 
+-	ctx->panel.backlight = visionox_vtdr6130_create_backlight(dsi);
++	ctx->panel.backlight =
++		visionox_vtdr6130_create_backlight(dsi,
++						   ctx->desc->max_brightness);
+ 	if (IS_ERR(ctx->panel.backlight))
+ 		return dev_err_probe(dev, PTR_ERR(ctx->panel.backlight),
+ 				     "Failed to create backlight\n");
+@@ -305,8 +541,43 @@
+ 	return devm_mipi_dsi_attach(dev, dsi);
+ }
+ 
++static const struct visionox_vtdr6130_desc visionox_vtdr6130_desc = {
++	.mode = &visionox_vtdr6130_mode,
++	.supplies = visionox_vtdr6130_supplies,
++	.num_supplies = ARRAY_SIZE(visionox_vtdr6130_supplies),
++	.reset_assert_ms = 10,
++	.reset_post_ms = 10,
++	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_NO_EOT_PACKET |
++		      MIPI_DSI_CLOCK_NON_CONTINUOUS,
++	.dsc_version_minor = 0x2,
++	.dsc_slice_height = 40,
++	.max_brightness = 4095,
++	.on = visionox_vtdr6130_on,
++};
++
++static const struct visionox_vtdr6130_desc visionox_vtdr6130_nicole_desc = {
++	.mode = &visionox_vtdr6130_nicole_mode,
++	.supplies = visionox_vtdr6130_nicole_supplies,
++	.num_supplies = ARRAY_SIZE(visionox_vtdr6130_nicole_supplies),
++	.supply_on_delay_ms = visionox_vtdr6130_nicole_supply_delays,
++	.reset_assert_ms = 25,
++	.reset_post_ms = 20,
++	/* Command mode, TE driven: no MIPI_DSI_MODE_VIDEO */
++	.mode_flags = MIPI_DSI_MODE_NO_EOT_PACKET |
++		      MIPI_DSI_CLOCK_NON_CONTINUOUS,
++	.dsc_version_minor = 0x1,
++	.dsc_slice_height = 20,
++	/* Vendor caps DBV at 2047; above that is the high brightness range */
++	.max_brightness = 2047,
++	.on = visionox_vtdr6130_nicole_on,
++};
++
+ static const struct of_device_id visionox_vtdr6130_of_match[] = {
+-	{ .compatible = "visionox,vtdr6130" },
++	{ .compatible = "visionox,vtdr6130", .data = &visionox_vtdr6130_desc },
++	{
++		.compatible = "visionox,vtdr6130-razer-nicole",
++		.data = &visionox_vtdr6130_nicole_desc,
++	},
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, visionox_vtdr6130_of_match);

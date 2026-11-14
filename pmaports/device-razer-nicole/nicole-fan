@@ -1,0 +1,162 @@
+#!/bin/sh
+# nicole-fan: temperature-driven fan control for the Razer Edge (nicole) MAX31760.
+#
+# Mainline drivers/hwmon/max31760.c is not a cooling device, so this loop does what
+# Razer's max31760_fan.c + the nicole thermal zones do on Android: pick a fan level 0..7
+# from temperatures and write the matching duty to pwm1 (manual mode, 25 kHz like
+# Razer's CR1=0x19). Level 0 (fan stopped) only happens under this loop, at low
+# temperatures (docs/guvenlik-kurallari.md §2, Kullanıcı kararı 25 Ekim 2026).
+#
+# Rules: "trip:hysteresis:level" in m°C, ascending. A rule climbs as soon as a trip is
+# reached and drops a step only below trip - hysteresis. The fan level is the highest
+# level of all rules.
+#   Razer (lahainap-nicole.dtsi:618-909): cpu6/7-bottom, gpu-top/bottom, video, quiet therm
+#   ours: hottest zone of all, battery temperature (+ lower trip while charging)
+#
+# Installed by device-razer-nicole as /usr/sbin/nicole-fan.
+# Fail safe: unreadable SoC zone -> level 7; on exit (stop, crash, signal) pwm1 = 255.
+# Under systemd, nicole-fan.service also sets full speed in ExecStopPost and restarts.
+# State for the lab scripts: /run/nicole-fan ("level duty rpm reason").
+#
+# Profiles (docs/guvenlik-kurallari.md §8, Kullanıcı onayı 29 Ekim): only the skin (quiet therm) table
+# changes; the SoC, hottest-zone and battery rules are the floor in every profile.
+# Read every loop from $PROFILE (one word); missing/unknown = dengeli (Razer's table).
+#   sessiz     fan off up to 40 C skin, full speed at 42 C at the latest
+#   dengeli    Razer's table (32..42 C -> level 2..7)
+#   performans 2 C earlier than Razer's (30..40 C -> level 2..7)
+set -u
+
+PERIOD="${NICOLE_FAN_PERIOD:-2}"
+DUTY="0 78 113 151 178 204 232 255"   # level 0..7, max31760_fan.c:80
+STATE="${NICOLE_FAN_STATE:-/run/nicole-fan}"
+PROFILE="${NICOLE_FAN_PROFILE:-/var/lib/nicole-fan/profil}"
+SYS="${NICOLE_FAN_SYS:-/sys}"   # tests point this at a fake tree
+
+log() { echo "nicole-fan: $*"; }
+
+# The driver takes no supplies, so at boot it can probe before PM8008 has powered
+# the chip (-ENXIO) and stay unbound: bind it again once the supplies are up.
+for c in "$SYS"/bus/i2c/devices/*; do
+	[ "$(cat "$c/name" 2>/dev/null)" = max31760 ] && [ ! -e "$c/driver" ] &&
+		{ echo "${c##*/}" > "$SYS/bus/i2c/drivers/max31760/bind" 2>/dev/null ||
+			log "bind ${c##*/} failed"; }
+done
+
+hw=""
+i=0
+while [ -z "$hw" ]; do
+	for d in $SYS/class/hwmon/hwmon*; do
+		[ "$(cat "$d/name" 2>/dev/null)" = max31760 ] && hw="$d"
+	done
+	[ -n "$hw" ] && break
+	i=$((i + 1))
+	[ "$i" -ge 30 ] && { log "max31760 hwmon not found"; exit 1; }
+	sleep 1
+done
+
+full() { echo 255 > "$hw/pwm1" 2>/dev/null; }
+trap 'full; log "exit: fan at full speed"; exit 0' INT TERM
+trap 'full' EXIT
+
+full
+# nicole has one fan: with tach 2 enabled its "fault" holds the chip at 100 % duty
+# (Razer: CR3=0x31, TACH2E off)
+echo 0 > "$hw/fan2_enable" || log "fan2_enable not cleared"
+echo 25000 > "$hw/pwm1_freq" || log "pwm1_freq not set"
+echo 1 > "$hw/pwm1_enable" || { log "cannot switch to manual mode"; exit 1; }
+
+zone() {
+	for z in $SYS/class/thermal/thermal_zone*; do
+		[ "$(cat "$z/type" 2>/dev/null)" = "$1" ] && { echo "$z/temp"; return; }
+	done
+}
+
+# rule NAME TEMP_mC "trip:hyst:level ..." -> sets LVL, keeps the step in st_NAME
+rule() {
+	local prev up=0 down=0 n=0 e trip rest hyst step
+	eval "prev=\${st_$1:-0}"
+	for e in $3; do
+		n=$((n + 1))
+		trip=${e%%:*}; rest=${e#*:}; hyst=${rest%%:*}
+		[ "$2" -ge "$trip" ] && up=$n
+		[ "$2" -ge $((trip - hyst)) ] && down=$n
+	done
+	step=$prev
+	[ "$up" -gt "$prev" ] && step=$up
+	[ "$down" -lt "$prev" ] && step=$down
+	eval "st_$1=$step"
+	LVL=0
+	[ "$step" -gt 0 ] && { set -- $3; shift $((step - 1)); LVL=${1##*:}; }
+}
+
+pick() { [ "$LVL" -gt "$best" ] && { best=$LVL; why="$1"; }; return 0; }
+
+SOC="cpu6-bottom-thermal cpu7-bottom-thermal gpu-top-thermal gpu-bottom-thermal video-thermal"
+for z in $SOC; do
+	p="$(zone "$z")"
+	[ -n "$p" ] || log "zone $z not found (counts as unreadable)"
+	eval "zp_$(echo "$z" | tr - _)=\"$p\""
+done
+quiet="$(ls $SYS/bus/iio/devices/iio:device*/in_temp_*quiet_therm*_input 2>/dev/null | head -1)"
+[ -n "$quiet" ] || log "quiet therm not found, skin rule off"
+bat="$(ls -d $SYS/class/power_supply/*/ 2>/dev/null | grep -i bat | head -1)"
+[ -n "$bat" ] || log "battery not found, battery rule off"
+log "hwmon $hw, quiet ${quiet:-none}, battery ${bat:-none}"
+
+last=""
+lastprof=""
+while :; do
+	best=0; why="idle"
+	prof=$(cat "$PROFILE" 2>/dev/null)
+	case "$prof" in
+		sessiz) skin="40000:2000:2 41000:2000:4 42000:2000:7" ;;
+		performans) skin="30000:2000:2 32000:2000:3 34000:2000:4 36000:2000:5 38000:2000:6 40000:2000:7" ;;
+		*) prof=dengeli; skin="32000:2000:2 34000:2000:3 36000:2000:4 38000:2000:5 40000:2000:6 42000:2000:7" ;;
+	esac
+	[ "$prof" != "$lastprof" ] && log "profile $prof"
+	lastprof=$prof
+
+	hottest=0
+	for z in $SOC; do
+		v="zp_$(echo "$z" | tr - _)"; eval "p=\$$v"
+		t=$(cat "$p" 2>/dev/null) || t=""
+		case "$t" in ''|*[!0-9-]*) best=7; why="$z unreadable"; continue ;; esac
+		case "$z" in
+			cpu*) rule "$(echo "$z" | tr - _)" "$t" "80000:5000:5 90000:5000:6 95000:5000:7" ;;
+			gpu*) rule "$(echo "$z" | tr - _)" "$t" "85000:5000:5 90000:5000:6 95000:0:7" ;;
+			video*) rule video "$t" "90000:2000:7" ;;
+		esac
+		pick "$z $t"
+	done
+	for f in $SYS/class/thermal/thermal_zone*/temp; do
+		t=$(cat "$f" 2>/dev/null) || continue
+		case "$t" in ''|*[!0-9-]*) continue ;; esac
+		[ "$t" -gt "$hottest" ] && hottest=$t
+	done
+	rule hottest "$hottest" "60000:5000:2 70000:5000:4 80000:5000:5 90000:5000:7"; pick "hottest $hottest"
+
+	if [ -n "$quiet" ]; then
+		t=$(cat "$quiet" 2>/dev/null) || t=""
+		case "$t" in ''|*[!0-9-]*) best=7; why="quiet unreadable" ;; *)
+			rule quiet "$t" "$skin"
+			pick "quiet $t $prof" ;;
+		esac
+	fi
+	if [ -n "$bat" ]; then
+		t=$(cat "${bat}temp" 2>/dev/null) || t=""   # 0.1 °C
+		case "$t" in ''|*[!0-9-]*) best=7; why="battery unreadable" ;; *)
+			t=$((t * 100))
+			rule bat "$t" "38000:2000:3 40000:2000:5 42000:2000:7"; pick "battery $t"
+			c=$t; [ "$(cat "${bat}status" 2>/dev/null)" = Charging ] || c=0
+			rule batchg "$c" "36000:2000:2"; pick "charging battery $c" ;;
+		esac
+	fi
+
+	set -- $DUTY; shift "$best"; duty=$1
+	echo "$duty" > "$hw/pwm1" || { log "pwm1 write failed"; exit 1; }
+	rpm=$(cat "$hw/fan1_input" 2>/dev/null || echo "?")
+	echo "$best $duty $rpm $why" > "$STATE"
+	[ "$best" != "$last" ] && log "level $best duty $duty ($why) rpm $rpm"
+	last=$best
+	sleep "$PERIOD"
+done

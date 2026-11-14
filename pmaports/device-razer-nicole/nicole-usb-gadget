@@ -1,0 +1,27 @@
+#!/bin/sh
+# USB network gadget when the initramfs set none up. Since r9 dwc3 also takes the QMP (USB3)
+# PHY, which is a module, so the UDC can appear after the initramfs looked for one; nothing
+# in the rootfs would then set it up (31 Ekim). Same gadget and address as postmarketOS'
+# initramfs (init_functions.sh, setup_usb_network_configfs and start_unudhcpd).
+C=/sys/kernel/config/usb_gadget
+[ -n "$(cat $C/g1/UDC 2>/dev/null)" ] && exit 0
+udc=$(ls /sys/class/udc 2>/dev/null | head -1)
+[ -n "$udc" ] || exit 0
+. /usr/share/deviceinfo/deviceinfo
+fn=${deviceinfo_usb_network_function:-ncm.usb0}
+if [ ! -d $C/g1 ]; then
+	mkdir -p $C/g1/strings/0x409 $C/g1/configs/c.1/strings/0x409 "$C/g1/functions/$fn" || exit 1
+	echo "${deviceinfo_usb_idVendor:-0x18D1}" > $C/g1/idVendor
+	echo "${deviceinfo_usb_idProduct:-0xD001}" > $C/g1/idProduct
+	echo "$deviceinfo_manufacturer" > $C/g1/strings/0x409/manufacturer
+	echo "${deviceinfo_usb_serialnumber:-postmarketOS}" > $C/g1/strings/0x409/serialnumber
+	echo "$deviceinfo_name" > $C/g1/strings/0x409/product
+	echo "USB network" > $C/g1/configs/c.1/strings/0x409/configuration
+	ln -s "$C/g1/functions/$fn" $C/g1/configs/c.1
+fi
+echo "$udc" > $C/g1/UDC || exit 1
+i=$(cat "$C/g1/functions/$fn/ifname")
+ip addr add 172.16.42.1/16 dev "$i" 2>/dev/null
+ip link set "$i" up
+systemctl restart "unudhcpd@$i.service"
+echo "USB ağ gadget'ı: $udc, $i 172.16.42.1"

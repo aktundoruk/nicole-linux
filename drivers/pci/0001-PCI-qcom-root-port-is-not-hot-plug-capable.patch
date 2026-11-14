@@ -1,0 +1,31 @@
+From: Doruk Aktun <info@dorukaktun.com>
+Subject: [PATCH] PCI: qcom: don't advertise Hot-Plug Capable on the Root Port
+
+The DWC default leaves Hot-Plug Capable set in Slot Capabilities. With
+CONFIG_HOTPLUG_PCI_PCIE off, pciehp_is_native() is then false and
+pci_bridge_d3_possible() refuses D3 for the port, before pcie_port_pm=force
+is even looked at. An empty port stays in D0, so dw_pcie_suspend_noirq()
+never turns the host off and the PCIe clocks hold XO through s2idle.
+
+The Razer Edge has a soldered WCN6855 and nothing hot-plugs on this link.
+
+---
+ drivers/pci/controller/dwc/pcie-qcom.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -396,6 +396,12 @@ static void qcom_pcie_set_slot_cap(struct dw_pcie *pci)
+ 	 * Attention Button Present in Slot Capabilities.
+ 	 */
+ 	val &= ~PCI_EXP_SLTCAP_ABP;
++
++	/*
++	 * Without pciehp a hot-plug port can't go to D3, and an empty port in
++	 * D0 keeps the host and its clocks on through system suspend.
++	 */
++	val &= ~PCI_EXP_SLTCAP_HPC;
+ 	writel(val, pci->dbi_base + offset + PCI_EXP_SLTCAP);
+ 
+ 	dw_pcie_dbi_ro_wr_dis(pci);

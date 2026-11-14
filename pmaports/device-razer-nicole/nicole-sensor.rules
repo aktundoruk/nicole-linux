@@ -1,0 +1,4 @@
+# The SLPI's FastRPC node can appear after multi-user.target's jobs were queued; the unit's
+# ConditionPathExists then skips it for the whole boot (2 of the last 9 boots, 4 Kasım). Sensors stay
+# dead, the SLPI never sleeps and DDR stays awake with it. Start the server when the node appears.
+SUBSYSTEM=="misc", KERNEL=="fastrpc-sdsp", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hexagonrpcd-sdsp.service"

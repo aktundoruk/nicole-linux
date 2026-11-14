@@ -1,0 +1,27 @@
+#!/bin/sh
+# Copy the USB-C data role that UCSI (pmic_glink, ADSP) reports into dwc3's role switch
+# (30 Ekim 2026). Run by udev on every typec add/change/remove (nicole-usb-rol.rules).
+# pmic_glink's connector@0 is off in the DTS because wiring it to dwc3 kept the link down;
+# until that is fixed this bridge does the same job: partner wants us as host (keyboard,
+# hub, flash drive) -> host; anything else, including nothing plugged in -> device, so the
+# USB network to a computer keeps working.
+P=/sys/class/typec/port0
+R=$(ls -d /sys/class/usb_role/*usb-role-switch 2>/dev/null | head -1)
+[ -n "$R" ] || exit 0
+# One plug fires 5-6 typec events at once and dwc3 applies a role asynchronously, so every
+# copy read the old role and wrote the new one again (1 Kasım 2026). Take turns, and wait
+# below until the role has taken effect, so the next copy sees it and leaves.
+exec 9>/run/nicole-usb-rol.lock
+flock 9 2>/dev/null || true
+rol=device
+if [ -e "$P-partner" ] && grep -q '\[host\]' "$P/data_role" 2>/dev/null; then
+	rol=host
+fi
+[ "$(cat "$R/role")" = "$rol" ] && exit 0
+echo "$rol" > "$R/role" && logger -t nicole-usb-rol "USB rolü: $rol"
+n=0
+while [ "$(cat "$R/role")" != "$rol" ] && [ $n -lt 20 ]; do
+	sleep 0.1
+	n=$((n + 1))
+done
+exit 0

@@ -1,0 +1,9 @@
+[Unit]
+Description=Save clock offset and RTC value every 15 minutes (nicole-saat)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

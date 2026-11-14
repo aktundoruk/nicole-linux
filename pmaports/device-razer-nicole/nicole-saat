@@ -1,0 +1,84 @@
+#!/bin/sh
+# nicole-saat: keeps the system clock from going back after the PMIC RTC was reset (6 Kasım).
+#
+# The pm8xxx RTC cannot be set from Linux, so pmOS' swclock-offset keeps "clock - RTC" in a
+# file and sets clock = RTC + offset at boot. Two holes on nicole:
+#   - rtc-pm8xxx is a module. When it registers, the kernel (RTC_HCTOSYS) sets the clock to
+#     the bare RTC (1970), after systemd had already advanced it to the timesyncd stamp. Only
+#     a later run of swclock-offset-boot repairs that, and nothing orders that run after rtc0.
+#   - The offset is written only at a clean shutdown. Holding the power key past the reset
+#     can clear the RTC (5 Kasım, round 1). RTC + old offset is then the past, and without
+#     network nothing corrects it.
+# This script replaces swclock-offset's ExecStart (drop-ins) and runs when rtc0 appears
+# (udev rule), and every 15 min (timer) it saves offset and RTC.
+#   kur      set the clock: RTC + offset, but never earlier than the newest saved time
+#            (timesyncd's clock file, touched every minute; our own record). An RTC lower
+#            than at the last save means it was reset: the offset is then worthless.
+#   kaydet   save offset and "RTC time" (also at shutdown).
+# NICOLE_SAAT_RTC/_OFS/_TSC/_SON/_SENK point to other files for tests; NICOLE_SAAT_DENEME=1
+# prints the decision without setting the clock or writing anything.
+RTC=${NICOLE_SAAT_RTC:-/sys/class/rtc/rtc0/since_epoch}
+OFS=${NICOLE_SAAT_OFS:-/var/cache/swclock-offset/offset-storage}
+TSC=${NICOLE_SAAT_TSC:-/var/lib/systemd/timesync/clock}
+SON=${NICOLE_SAAT_SON:-/var/lib/nicole-saat/son}
+SENK=${NICOLE_SAAT_SENK:-/run/systemd/timesync/synchronized}
+DENEME=${NICOLE_SAAT_DENEME:-}
+
+mt() { if [ -e "$1" ]; then stat -c %Y "$1"; else echo 0; fi; }
+sayi() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+
+kaydet() {
+	r=$(cat "$RTC") || return 1
+	s=$(date -u +%s)
+	[ -n "$DENEME" ] && { echo "kaydet: fark $((s - r)), rtc $r, saat $s"; return 0; }
+	mkdir -p "${OFS%/*}" "${SON%/*}" || return 1
+	echo $((s - r)) > "$OFS.yeni" && mv "$OFS.yeni" "$OFS" || return 1
+	echo "$r $s" > "$SON.yeni" && mv "$SON.yeni" "$SON" || return 1
+	sync
+}
+
+kur() {
+	[ -r "$RTC" ] || { echo "rtc0 yok, udev görünce yeniden çalışacak"; return 0; }
+	if [ -e "$SENK" ]; then
+		echo "saat ağdan eşitlenmiş, dokunulmadı"
+		kaydet 2>/dev/null
+		return 0
+	fi
+	r=$(cat "$RTC")
+	s=$(date -u +%s)
+	son_r=; son_s=0
+	[ -s "$SON" ] && read -r son_r son_s < "$SON"
+	sayi "$son_r" || son_r=
+	sayi "$son_s" || son_s=0
+	taban=$(mt "$TSC")
+	o=$(mt "$OFS"); [ "$o" -gt "$taban" ] && taban=$o
+	[ "$son_s" -gt "$taban" ] && taban=$son_s
+	f=$(cat "$OFS" 2>/dev/null)
+	if sayi "$f"; then aday=$((r + f)); else aday=$s; fi
+	neden=
+	if [ -n "$son_r" ] && [ "$r" -lt "$son_r" ]; then
+		neden="RTC sıfırlanmış (son kayıtta $son_r, şimdi $r)"
+		aday=$taban
+	elif [ "$aday" -lt "$taban" ]; then
+		neden="RTC + fark ($aday) son kayıttan ($taban) geride"
+		aday=$taban
+	fi
+	if [ -n "$DENEME" ]; then
+		echo "kur: saat $aday${neden:+, $neden}"
+		return 0
+	fi
+	date -u -s "@$aday" > /dev/null
+	if [ -n "$neden" ]; then
+		echo "$neden: saat son kayda çekildi, $(date -u -d "@$aday" '+%F %T') UTC; ağ gelince düzelir"
+	else
+		echo "saat RTC + farktan kuruldu"
+	fi
+	# Root may still be read-only this early; the timer saves again within minutes.
+	kaydet 2>/dev/null || echo "kayıt yazılamadı, zamanlayıcı yazacak"
+}
+
+case "$1" in
+	kur) kur ;;
+	kaydet) kaydet ;;
+	*) echo "kullanım: nicole-saat kur|kaydet" >&2; exit 2 ;;
+esac

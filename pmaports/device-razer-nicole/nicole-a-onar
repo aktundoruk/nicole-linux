@@ -1,0 +1,66 @@
+#!/bin/sh
+# nicole-a-onar: from the rescue slot B, repair slot A without a Mac (docs/guvenlik-kurallari.md §8 Faz 4).
+#
+# Mounts A's install (inner GPT in userdata: pmOS_boot + pmOS_root, 4096-byte sectors) in a
+# private mount namespace at /mnt/a, then:
+#   geri   write back the boot images A kept before its last update (the usual repair after
+#          a kernel that does not boot: nicole-imaj --kurulum /mnt/a --geri)
+#   yaz    build A's images from A's /boot and write them (after fixing A in 'kabuk')
+#   kabuk  a shell chrooted into A (apk, mkinitfs, editing /etc), proc/sys/dev bound
+#   durum  what A holds: its kernel, its kept images, the slots' tries (read only)
+# Writes only boot_a / vendor_boot_a (through nicole-imaj, which refuses anything else) and
+# A's own filesystem. Then: reboot to fastboot and set A active, or let B stay.
+#
+# Usage: doas nicole-a-onar geri|yaz|kabuk|durum
+set -eu
+hata() { echo "nicole-a-onar: $*" >&2; exit 1; }
+KOMUT=${1:-}
+case "$KOMUT" in geri|yaz|kabuk|durum) ;; *) hata "kullanım: nicole-a-onar geri|yaz|kabuk|durum" ;; esac
+[ "$(id -u)" = 0 ] || hata "root gerekli"
+grep -qw "androidboot.slot_suffix=_b" /proc/cmdline || hata "yalnız kurtarma slotu B'den çalışır"
+[ -n "${NICOLE_A_ONAR_NS:-}" ] || NICOLE_A_ONAR_NS=1 exec unshare -m --propagation private "$0" "$@"
+
+P=$(readlink -f /dev/disk/by-partlabel/userdata)
+[ -b "$P" ] || hata "userdata bulunamadı"
+grep -q "^$P " /proc/mounts && hata "$P doğrudan bağlı"
+M=/mnt/a
+L=$(losetup -j "$P" | cut -d: -f1 | head -1)
+YENI_L=
+if [ -z "$L" ]; then
+	if [ "$KOMUT" = durum ]; then RO=-r; else RO=; fi
+	# shellcheck disable=SC2086
+	L=$(losetup --show -P -f --sector-size 4096 $RO "$P")
+	YENI_L=$L
+fi
+temizle() {
+	umount -R "$M" 2>/dev/null || true
+	[ -z "$YENI_L" ] || losetup -d "$YENI_L" 2>/dev/null || true
+}
+trap temizle EXIT
+for i in 1 2 3 4 5; do [ -b "${L}p2" ] && break; partprobe "$L" 2>/dev/null || true; sleep 1; done
+[ -b "${L}p1" ] && [ -b "${L}p2" ] || hata "A'nın alt bölümleri görünmedi ($L)"
+mkdir -p "$M"
+if [ "$KOMUT" = durum ]; then
+	mount -o ro,noload "${L}p2" "$M"
+	mount -o ro "${L}p1" "$M/boot"
+else
+	mount "${L}p2" "$M"
+	mount "${L}p1" "$M/boot"
+fi
+grep -q "slot A" "$M/etc/nicole-kurulum" 2>/dev/null || hata "$M slot A'nın kurulumu değil"
+
+case "$KOMUT" in
+durum)
+	cat "$M/etc/nicole-kurulum"
+	echo "A'nın çekirdeği: $(ls "$M/lib/modules" | tr '\n' ' ')"
+	ls -l "$M/var/lib/nicole-imaj/onceki" 2>/dev/null || echo "saklanmış imaj yok"
+	nicole-slot durum
+	;;
+geri) nicole-imaj --kurulum "$M" --geri ;;
+yaz) nicole-imaj --kurulum "$M" --yaz ;;
+kabuk)
+	for d in proc sys dev; do mount --rbind "/$d" "$M/$d"; mount --make-rslave "$M/$d"; done
+	echo "A'nın içindesin ($M). Çıkınca: doas nicole-a-onar yaz (gerekirse)."
+	chroot "$M" /bin/sh -l || true
+	;;
+esac

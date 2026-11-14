@@ -1,0 +1,14 @@
+[Unit]
+Description=Razer Edge audio routing (ALSA UCM HiFi: speakers + internal mic)
+# The card comes up when the ADSP (q6afe/q6asm) and the LPASS/SoundWire/WCD938x
+# modules have probed, a few seconds into boot. No PipeWire session manager runs
+# on this image yet, so nothing else applies the UCM profile.
+After=sound.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for i in $(seq 60); do [ -e /dev/snd/controlC0 ] && grep -q Razer-Edge /proc/asound/card0/id /proc/asound/cards 2>/dev/null && exec alsaucm -c hw:0 set _verb HiFi set _enadev Speaker set _enadev Mic; sleep 1; done; echo "ses karti gelmedi" >&2; exit 1'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

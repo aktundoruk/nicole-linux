@@ -1,0 +1,2 @@
+# The logged-in user may play vibration patterns on the AW8622x (30 Ekim 2026)
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="aw8622x-haptics", TAG+="uaccess"

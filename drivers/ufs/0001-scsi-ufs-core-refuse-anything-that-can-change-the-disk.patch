@@ -1,0 +1,180 @@
+From: Doruk Aktun <info@dorukaktun.com>
+Subject: [PATCH] scsi: ufs: core: only let writes through where the command line says
+
+The internal disk of the Razer Edge holds Android, the boot chain and
+calibration data that cannot be recreated. A block-layer read-only flag is one
+BLKROSET away from gone and says nothing about which partition a write is for.
+Check every command in the host driver instead: reads and power management
+pass, writes pass only inside ufshcd_core.write_ranges=LUN:START:COUNT[,...],
+anything else is refused with DATA PROTECT. Default and malformed lists leave
+the disk closed. Raw UPIUs through ufs-bsg can reach everything, so they are
+refused too.
+
+Local to this port, not for upstream.
+
+---
+diff --git a/drivers/ufs/core/ufs_bsg.c b/drivers/ufs/core/ufs_bsg.c
+index 7a66917b3..0dd714e7f 100644
+--- a/drivers/ufs/core/ufs_bsg.c
++++ b/drivers/ufs/core/ufs_bsg.c
+@@ -140,6 +140,10 @@ static int ufs_bsg_request(struct bsg_job *job)
+ 	int ret;
+ 	bool rpmb = false;
+ 
++	/* raw UPIUs can write descriptors, attributes and the disk itself */
++	if (IS_ENABLED(CONFIG_SCSI_UFS_BSG))
++		return -EPERM;
++
+ 	bsg_reply->reply_payload_rcv_len = 0;
+ 
+ 	ufshcd_rpm_get_sync(hba);
+diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
+index 54f4e7d7d..25eafe595 100644
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -120,6 +120,63 @@ static bool is_mcq_supported(struct ufs_hba *hba)
+ module_param(use_mcq_mode, bool, 0644);
+ MODULE_PARM_DESC(use_mcq_mode, "Control MCQ mode for controllers starting from UFSHCI 4.0. 1 - enable MCQ, 0 - disable MCQ. MCQ is enabled by default");
+ 
++/*
++ * This disk also holds another operating system and the phone's boot chain and
++ * calibration data. Only commands that cannot change its contents reach the
++ * device, plus writes inside the ranges given on the command line:
++ * ufshcd_core.write_ranges=LUN:START:COUNT[,...] in logical blocks. A malformed
++ * list leaves the disk closed.
++ */
++struct ufshcd_write_range {
++	u8 lun;
++	u64 start;
++	u64 count;
++};
++static struct ufshcd_write_range ufshcd_write_ranges[8];
++static unsigned int ufshcd_nr_write_ranges;
++static char ufshcd_write_ranges_str[200];
++
++static int ufshcd_write_ranges_set(const char *val, const struct kernel_param *kp)
++{
++	const char *p = val;
++	unsigned int n = 0;
++
++	ufshcd_nr_write_ranges = 0;
++	while (*p && *p != '\n') {
++		unsigned long long start, count;
++		unsigned int lun;
++		int used = 0;
++
++		if (n == ARRAY_SIZE(ufshcd_write_ranges) ||
++		    sscanf(p, "%u:%llu:%llu%n", &lun, &start, &count, &used) != 3 ||
++		    lun > 7 || !count || start + count < start)
++			return -EINVAL;
++		ufshcd_write_ranges[n++] = (struct ufshcd_write_range) {
++			.lun = lun, .start = start, .count = count,
++		};
++		p += used;
++		if (*p == ',')
++			p++;
++		else if (*p && *p != '\n')
++			return -EINVAL;
++	}
++	strscpy(ufshcd_write_ranges_str, val);
++	ufshcd_nr_write_ranges = n;
++	return 0;
++}
++
++static int ufshcd_write_ranges_get(char *buffer, const struct kernel_param *kp)
++{
++	return sysfs_emit(buffer, "%s\n", ufshcd_write_ranges_str);
++}
++
++static const struct kernel_param_ops ufshcd_write_ranges_ops = {
++	.set = ufshcd_write_ranges_set,
++	.get = ufshcd_write_ranges_get,
++};
++module_param_cb(write_ranges, &ufshcd_write_ranges_ops, NULL, 0444);
++MODULE_PARM_DESC(write_ranges, "LUN:START:COUNT[,...]: where writes may reach the disk. Default: nowhere");
++
+ static unsigned int uic_cmd_timeout = UIC_CMD_TIMEOUT_DEFAULT;
+ 
+ static int uic_cmd_timeout_set(const char *val, const struct kernel_param *kp)
+@@ -3082,6 +3139,66 @@ static int ufshcd_init_cmd_priv(struct Scsi_Host *host, struct scsi_cmnd *cmd)
+ 	return 0;
+ }
+ 
++static bool ufshcd_range_is_writable(u8 lun, u64 lba, u64 count)
++{
++	unsigned int i;
++
++	if (!count || lba + count < lba)
++		return false;
++	for (i = 0; i < ufshcd_nr_write_ranges; i++) {
++		const struct ufshcd_write_range *r = &ufshcd_write_ranges[i];
++
++		if (r->lun == lun && lba >= r->start &&
++		    lba + count <= r->start + r->count)
++			return true;
++	}
++	return false;
++}
++
++static bool ufshcd_cmd_may_reach_disk(struct scsi_cmnd *cmd)
++{
++	struct request *rq = scsi_cmd_to_rq(cmd);
++	u8 lun = ufshcd_scsi_to_upiu_lun(cmd->device->lun);
++	const u8 *cdb = cmd->cmnd;
++	const u8 *buf;
++
++	switch (cdb[0]) {
++	case TEST_UNIT_READY:
++	case REQUEST_SENSE:
++	case INQUIRY:
++	case MODE_SENSE:
++	case MODE_SENSE_10:
++	case READ_CAPACITY:
++	case SERVICE_ACTION_IN_16:
++	case REPORT_LUNS:
++	case READ_6:
++	case READ_10:
++	case READ_16:
++	/* power modes of the device; no data */
++	case START_STOP:
++	/* writes back only what the rules below let in */
++	case SYNCHRONIZE_CACHE:
++		return true;
++	case WRITE_10:
++		return ufshcd_range_is_writable(lun, get_unaligned_be32(&cdb[2]),
++						get_unaligned_be16(&cdb[7]));
++	case WRITE_16:
++		return ufshcd_range_is_writable(lun, get_unaligned_be64(&cdb[2]),
++						get_unaligned_be32(&cdb[10]));
++	case UNMAP:
++		/* what sd_setup_unmap_cmnd() builds: one descriptor */
++		if (!(rq->rq_flags & RQF_SPECIAL_PAYLOAD))
++			return false;
++		buf = bvec_virt(&rq->special_vec);
++		if (get_unaligned_be16(&buf[2]) != 16)
++			return false;
++		return ufshcd_range_is_writable(lun, get_unaligned_be64(&buf[8]),
++						get_unaligned_be32(&buf[16]));
++	default:
++		return false;
++	}
++}
++
+ /**
+  * ufshcd_queuecommand - main entry point for SCSI requests
+  * @host: SCSI host pointer
+@@ -3097,6 +3214,14 @@ static enum scsi_qc_status ufshcd_queuecommand(struct Scsi_Host *host,
+ 	int err = 0;
+ 	struct ufs_hw_queue *hwq = NULL;
+ 
++	if (!ufshcd_cmd_may_reach_disk(cmd)) {
++		dev_warn_ratelimited(hba->dev, "refused SCSI opcode 0x%02x on LUN %llu\n",
++				     cmd->cmnd[0], cmd->device->lun);
++		scsi_build_sense(cmd, 0, DATA_PROTECT, 0x27, 0x00);
++		scsi_done(cmd);
++		return 0;
++	}
++
+ 	switch (hba->ufshcd_state) {
+ 	case UFSHCD_STATE_OPERATIONAL:
+ 		break;

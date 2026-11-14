@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""Builds the boot images nicole's ABL boots, on the phone, from what /boot already holds.
+
+boot-deploy writes a header v1 boot.img, which this ABL never boots, and its own v3 path puts
+the initramfs and cmdline in vendor_boot without the SoC IDs. So this keeps the layout proven
+since 25 Oct 2026 (scripts/build/make-bootimg.sh, d5): v3 boot with kernel, initramfs and
+cmdline, v3 vendor_boot with an empty ramdisk and the DTB carrying the SoC IDs. dtbo_a stays.
+
+The cmdline comes from boot-deploy's boot.img, so it follows /usr/lib/kernel-cmdline.d,
+/etc/kernel-cmdline.d and /etc/fstab. For the running install, or with --kurulum DIR for
+another one mounted at DIR (its /boot at DIR/boot): the slot being set up for a new root.
+
+Writes files only, never a partition. Refuses what would not boot or would lock us out:
+  - the root UUID is not the running root's (or, with --kurulum, not DIR's filesystem), or
+    pmos_boot_uuid is not the filesystem at <install>/boot;
+  - the root is on UFS and its partition is not among the write ranges (it could not write;
+    more ranges may be listed: the rescue slot also opens userdata);
+  - rdinit= names a file the initramfs lacks (a panic, which uses up a boot attempt);
+  - root on UFS, but the initramfs would not use 4096-byte sectors (root not found);
+  - no modules in /lib/modules for this kernel;
+  - the cmdline or an image does not fit.
+
+With --yaz (docs/guvenlik-kurallari.md §8 Faz 4: "Linux kendi açılış imajlarını yazabilir") it then writes them
+to the running slot's own boot_x and vendor_boot_x, so a kernel update needs no Mac:
+  apk upgrade (mkinitfs + boot-deploy refresh /boot)  ->  nicole-imaj --yaz  ->  reboot.
+Only those two partitions, found by name and checked against sysfs; both must lie inside the
+kernel's UFS write ranges; the new cmdline must open them again (or the next boot could not
+update itself); what the partitions held is kept in DIR/onceki first; vendor_boot then boot,
+each read back from the device after the write. A kernel that does not come up: the boot
+watcher or panic= restarts, every start uses one of the slot's seven tries, then ABL boots
+the rescue slot B. A kernel that comes up but misbehaves: nicole-imaj --geri writes the kept
+images back.
+
+From the rescue slot B, --kurulum DIR --yaz / --geri write slot A's partitions instead (B
+repairs A, docs/guvenlik-kurallari.md §8; nicole-a-onar mounts A and calls this): only from B, only when DIR
+is slot A's install (DIR/etc/nicole-kurulum), with A's cmdline, and DIR/var/lib/nicole-imaj
+as A's own output and kept images. A never writes B.
+
+Usage: nicole-imaj [--cikti DIR] [--cmdline "..."] [--kurulum DIR] [--yaz | --geri]
+"""
+import argparse
+import fcntl
+import gzip
+import hashlib
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+PAGE = 4096
+KERNEL_ADDR, RAMDISK_ADDR, TAGS_ADDR, DTB_ADDR = 0x8000, 0x01000000, 0x100, 0x01f00000
+# 12.0.0 / 2025-01, as slot B's stock boot image; the working chain used it
+OS_VERSION = (12 << 25) | (25 << 4) | 1
+BOLUM_BOY = 96 << 20                # boot_a and vendor_boot_a
+SOC_MSM_ID = ["439", "131073", "502", "131073"]  # SM8350 0x1b7 and 0x1f6, v2.1
+SOC_BOARD_ID = ["0", "0"]
+# newc archive with only the TRAILER, gzip -9: the vendor ramdisk of the proven images
+BOS_RAMDISK = bytes.fromhex(
+    "1f8b080000000000020333303730373034200e10ab0e1d38c11821418e9e3eae418a8a8a0ca360500000c7228ac300020000")
+ARALIK = "ufshcd_core.write_ranges"
+ARALIK_SYS = "/sys/module/ufshcd_core/parameters/write_ranges"
+BLKFLSBUF = 0x1261  # drop the block device's cached pages, so the read-back hits the device
+
+
+def hata(ileti):
+    sys.exit(f"nicole-imaj: {ileti}")
+
+
+def oku(yol):
+    with open(yol, "rb") as f:
+        return f.read()
+
+
+def dolgu(b):
+    return b + b"\0" * (-len(b) % PAGE)
+
+
+def boot_v3(cekirdek, ramdisk, cmdline):
+    c = cmdline.encode()
+    if len(c) >= 1536:
+        hata(f"komut satırı {len(c)} bayt, sınır 1536")
+    h = b"ANDROID!" + struct.pack("<4I16xI", len(cekirdek), len(ramdisk), OS_VERSION, 1580, 3)
+    return dolgu(h + c.ljust(1536, b"\0")) + dolgu(cekirdek) + dolgu(ramdisk)
+
+
+def vendor_boot_v3(dtb):
+    h = b"VNDRBOOT" + struct.pack("<5I", 3, PAGE, KERNEL_ADDR, RAMDISK_ADDR, len(BOS_RAMDISK))
+    h += b"\0" * 2048 + struct.pack("<I16xIIQ", TAGS_ADDR, 2112, len(dtb), DTB_ADDR)
+    return dolgu(h) + dolgu(BOS_RAMDISK) + dolgu(dtb)
+
+
+def deploy_cmdline(yol):
+    """The cmdline boot-deploy wrote into its header v1 image, without pmOS' quiet."""
+    b = oku(yol)[:1632]
+    if b[:8] != b"ANDROID!":
+        hata(f"{yol} bir boot imajı değil")
+    c = (b[64:576].rstrip(b"\0") + b[608:1632].rstrip(b"\0")).decode()
+    return " ".join(k for k in c.split() if k != "quiet")
+
+
+def kelime(cmdline, ad):
+    for k in cmdline.split():
+        if k.startswith(ad + "="):
+            return k.split("=", 1)[1]
+    return None
+
+
+def initramfs_dosyalari(yol):
+    """name -> contents of the first newc archive."""
+    b = oku(yol)
+    if b[:2] == b"\x1f\x8b":
+        b = gzip.decompress(b)
+    elif b[:4] == b"\x28\xb5\x2f\xfd":
+        b = subprocess.run(["zstd", "-dc", yol], check=True, capture_output=True).stdout
+    else:
+        hata(f"{yol}: sıkıştırması tanınmadı")
+    dosyalar, i = {}, 0
+    while True:
+        if b[i:i + 6] != b"070701":
+            hata(f"{yol}: cpio başlığı bozuk ({i})")
+        boy, ad_boy = int(b[i + 54:i + 62], 16), int(b[i + 94:i + 102], 16)
+        ad = b[i + 110:i + 110 + ad_boy - 1].decode()
+        v = i + 110 + ad_boy
+        v += -v % 4
+        if ad == "TRAILER!!!":
+            return dosyalar
+        dosyalar[ad] = b[v:v + boy]
+        i = v + boy
+        i += -i % 4
+
+
+def cekirdek_surumu(cekirdek):
+    if cekirdek[:2] == b"\x1f\x8b":
+        cekirdek = gzip.decompress(cekirdek)
+    m = re.search(rb"Linux version (\S+)", cekirdek)
+    if not m:
+        hata("çekirdekte sürüm dizgesi yok")
+    return m.group(1).decode()
+
+
+def fdt(*a):
+    return subprocess.run(a, check=True, capture_output=True, text=True).stdout
+
+
+def ufs_acik_mi():
+    t = "/sys/firmware/devicetree/base/soc@0"
+    for d in os.listdir(t):
+        if re.match(r"ufshc?@", d):
+            try:
+                return oku(f"{t}/{d}/status").rstrip(b"\0") == b"okay"
+            except FileNotFoundError:
+                return True
+    return False
+
+
+def dtb_hazirla(yol, gecici, ufs):
+    """Same steps as make-bootimg.sh and ufs-acik-dtb.sh, in the same order."""
+    d = os.path.join(gecici, "soc.dtb")
+    shutil.copyfile(yol, d)
+    if ufs:
+        dugum = fdt("fdtget", "-l", d, "/soc@0").split()
+        u = [n for n in dugum if re.match(r"ufshc?@", n)]
+        p = [n for n in dugum if n.startswith("phy@1d87000")]
+        if not u or not p:
+            hata("DTB'de UFS düğümleri yok")
+        fdt("fdtput", "-t", "s", d, f"/soc@0/{u[0]}", "status", "okay")
+        fdt("fdtput", "-t", "s", d, f"/soc@0/{p[0]}", "status", "okay")
+    for ozellik in ("qcom,msm-id", "qcom,board-id", "qcom,pmic-id"):
+        subprocess.run(["fdtput", "-d", d, "/", ozellik], capture_output=True)
+    fdt("fdtput", "-t", "u", d, "/", "qcom,msm-id", *SOC_MSM_ID)
+    fdt("fdtput", "-t", "u", d, "/", "qcom,board-id", *SOC_BOARD_ID)
+    return oku(d)
+
+
+def bul(dizin, alan):
+    return subprocess.run(["findmnt", "-n", "-o", alan, "--target", dizin], capture_output=True,
+                          text=True).stdout.strip()
+
+
+def kok_araligi(dizin):
+    """LUN:START:COUNT of the UFS partition that holds the filesystem mounted at `dizin`
+    (through the initramfs' loop device), or None when it is not on UFS."""
+    m = re.fullmatch(r"/dev/(loop\d+)p\d+", bul(dizin, "SOURCE"))
+    if not m:
+        return None
+    try:
+        arka = os.path.realpath(oku(f"/sys/block/{m[1]}/loop/backing_file").decode().strip())
+    except FileNotFoundError:
+        return None
+    n = os.path.basename(arka)
+    lu = re.fullmatch(r"(sd[a-z]+)\d+", n)
+    if not lu:
+        return None
+    bs = int(oku(f"/sys/block/{lu[1]}/queue/logical_block_size"))
+    bas = int(oku(f"/sys/class/block/{n}/start")) * 512 // bs
+    boy = int(oku(f"/sys/class/block/{n}/size")) * 512 // bs
+    lun = os.path.basename(os.path.realpath(f"/sys/block/{lu[1]}/device")).split(":")[3]
+    return f"{lun}:{bas}:{boy}"
+
+
+def denetle(cmdline, cekirdek, ramdisk_yol, ufs, hedef="/"):
+    """`hedef`: the install the image is for, mounted there with its /boot ('/' = running)."""
+    kok = kelime(cmdline, "pmos_root_uuid")
+    if hedef == "/":
+        calisan = kelime(oku("/proc/cmdline").decode(), "pmos_root_uuid")
+        if not kok or kok != calisan:
+            hata(f"kök UUID {kok}, çalışan kök {calisan}")
+    if not kok or kok != bul(hedef, "UUID"):
+        hata(f"kök UUID {kok}, {hedef} üzerindeki dosya sistemi {bul(hedef, 'UUID') or '?'}")
+    acilis = kelime(cmdline, "pmos_boot_uuid")
+    if not acilis:
+        hata("komut satırında pmos_boot_uuid yok")
+    if acilis != bul(os.path.join(hedef, "boot"), "UUID"):
+        hata(f"pmos_boot_uuid {acilis}, {hedef}/boot üzerindeki {bul(os.path.join(hedef, 'boot'), 'UUID') or '?'}")
+
+    # write ranges: the root's own partition must be among them (a UFS root without it
+    # cannot write); more ranges may be given (the rescue slot also opens userdata)
+    araliklar = (kelime(cmdline, ARALIK) or "").split(",") if kelime(cmdline, ARALIK) else []
+    if any(not re.fullmatch(r"\d+:\d+:\d+", a) for a in araliklar) or len(araliklar) > 8:
+        hata(f"yazma aralığı bozuk: '{kelime(cmdline, ARALIK)}'")
+    if ufs and not os.path.exists(ARALIK_SYS):
+        hata("UFS açık ama çalışan çekirdekte yazma koruması yok")
+    kendi = kok_araligi(hedef)
+    if kendi and kendi not in araliklar:
+        hata(f"kök UFS'de ({kendi}) ama yazma aralığında yok: '{kelime(cmdline, ARALIK)}'")
+
+    dosyalar = initramfs_dosyalari(ramdisk_yol)
+    rd = kelime(cmdline, "rdinit")
+    if rd and rd.lstrip("/") not in dosyalar:
+        hata(f"{rd} initramfs'te yok")
+    if kendi:
+        # a UFS root: same order as the initramfs reads them, the last one wins
+        s = None
+        for ad in ("usr/share/deviceinfo/deviceinfo", "usr/share/deviceinfo/device-razer-nicole", "etc/deviceinfo"):
+            m = re.findall(rb'^deviceinfo_rootfs_image_sector_size="(\d+)"', dosyalar.get(ad, b""), re.M)
+            s = m[-1] if m else s
+        if s != b"4096":
+            hata(f"kök UFS'de ama initramfs'te sektör boyu {s}")
+
+    surum = cekirdek_surumu(cekirdek)
+    if not os.path.isdir(os.path.join(hedef, f"lib/modules/{surum}")):
+        hata(f"{hedef}/lib/modules/{surum} yok")
+    return surum
+
+
+def yaz(yol, veri):
+    t = yol + ".yeni"
+    with open(t, "wb") as f:
+        f.write(veri)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(t, yol)
+
+
+# --- writing the running slot's own boot partitions (--yaz, --geri) ---
+
+def hedef_slot(kurulum, verilen=None):
+    """Which slot's partitions --yaz/--geri may write: the running slot for the running
+    install; slot A for A's install mounted on the rescue slot B; nothing else."""
+    if verilen:
+        return verilen
+    calisan = calisan_slot()
+    if kurulum == "/":
+        return calisan
+    if calisan != "b":
+        hata("başka bir kurulumun bölümlerine yalnız kurtarma slotu B yazar (A'yı onarmak için)")
+    try:
+        bilgi = oku(os.path.join(kurulum, "etc/nicole-kurulum")).decode()
+    except FileNotFoundError:
+        hata(f"{kurulum}/etc/nicole-kurulum yok: bu A'nın kurulumu mu?")
+    if not re.search(r"\bslot A\b", bilgi):
+        hata(f"{kurulum} slot A'nın kurulumu değil: {bilgi.strip()}")
+    return "a"
+
+
+def calisan_slot():
+    m = re.search(r"androidboot\.slot_suffix=_([ab])\b", oku("/proc/cmdline").decode())
+    if not m:
+        hata("çalışan slot bilinmiyor (androidboot.slot_suffix yok)")
+    return m[1]
+
+
+class Bolum:
+    """A partition found by name, checked against sysfs; or an image file (tests)."""
+
+    def __init__(self, ad, yol=None):
+        self.ad = ad
+        self.yol = yol or os.path.realpath(f"/dev/disk/by-partlabel/{ad}")
+        self.aralik = None
+        if yol:
+            self.boy = os.path.getsize(yol)
+            return
+        n = os.path.basename(self.yol)
+        lu = re.fullmatch(r"(sd[a-z]+)\d+", n)
+        if not lu:
+            hata(f"{ad}: {self.yol} bir UFS bölümü değil")
+        olay = oku(f"/sys/class/block/{n}/uevent").decode()
+        if f"PARTNAME={ad}\n" not in olay:
+            hata(f"{self.yol} sysfs'e göre {ad} değil")
+        bs = int(oku(f"/sys/block/{lu[1]}/queue/logical_block_size"))
+        bas = int(oku(f"/sys/class/block/{n}/start")) * 512 // bs
+        self.boy = int(oku(f"/sys/class/block/{n}/size")) * 512
+        lun = int(os.path.basename(os.path.realpath(f"/sys/block/{lu[1]}/device")).split(":")[3])
+        self.aralik = (lun, bas, self.boy // bs)
+
+
+def araliklar_coz(metin):
+    return [tuple(map(int, a.split(":"))) for a in (metin or "").split(",") if a]
+
+
+def kapsar(araliklar, aralik):
+    lun, bas, boy = aralik
+    return any(l == lun and b <= bas and bas + boy <= b + n for l, b, n in araliklar)
+
+
+def imaj_boyu(b):
+    """Length of the v3 boot or vendor_boot image at the start of b, or None."""
+    def p(n):
+        return n + (-n % PAGE)
+    if b[:8] == b"ANDROID!" and struct.unpack_from("<I", b, 40)[0] == 3:
+        k, r = struct.unpack_from("<II", b, 8)
+        return PAGE + p(k) + p(r)
+    if b[:8] == b"VNDRBOOT" and struct.unpack_from("<I", b, 8)[0] == 3:
+        sayfa, = struct.unpack_from("<I", b, 12)
+        r, = struct.unpack_from("<I", b, 24)
+        bas_boy, d = struct.unpack_from("<II", b, 2096)
+        if sayfa != PAGE:
+            return None
+        return p(bas_boy) + p(r) + p(d)
+    return None
+
+
+def bolum_oku(bolum, n):
+    with open(bolum.yol, "rb", buffering=0) as f:
+        if bolum.aralik:
+            fcntl.ioctl(f.fileno(), BLKFLSBUF)
+        b = f.read(n)
+    if len(b) != n:
+        hata(f"{bolum.ad}: {n} bayt okunamadı")
+    return b
+
+
+def mevcut(bolum):
+    """What the partition holds: the image by its header, or all of it when unreadable."""
+    bas = bolum_oku(bolum, 2 * PAGE)
+    n = imaj_boyu(bas)
+    if n is None or n > bolum.boy:
+        print(f"{bolum.ad}: tanınan bir v3 imajı yok, bölümün tamamı saklanıyor")
+        n = bolum.boy
+    return bolum_oku(bolum, n)
+
+
+def bolume_yaz(bolum, veri):
+    """One partition: write, flush, drop the cache, read back from the device, compare."""
+    bayrak = os.O_WRONLY | os.O_CLOEXEC | (os.O_EXCL if bolum.aralik else 0)
+    fd = os.open(bolum.yol, bayrak)  # O_EXCL: refuses a block device someone holds open
+    try:
+        g = memoryview(veri)
+        while g:
+            g = g[os.write(fd, g[:1 << 20]):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if bolum_oku(bolum, len(veri)) != veri:
+        hata(f"{bolum.ad}: geri okunan yazılanla aynı değil (bölüm şimdi bozuk olabilir: "
+             f"nicole-imaj --geri, ya da kurtarma slotu)")
+
+
+def bolumlere_yaz(cikti, imajlar, slot, hedefler, yeni_cmdline=None, onceki_sakla=True):
+    """imajlar: {"boot": bytes, "vendor_boot": bytes}. vendor_boot first: a cut between the
+    two leaves the old kernel with the new DTB, which changes rarely."""
+    if os.geteuid() != 0 and not hedefler:
+        hata("root gerekli")
+    bolumler = {t: Bolum(f"{t}_{slot}", hedefler.get(t)) for t in ("vendor_boot", "boot")}
+    for t, b in bolumler.items():
+        if len(imajlar[t]) > b.boy or len(imajlar[t]) % PAGE:
+            hata(f"{b.ad}: imaj {len(imajlar[t])} bayt, bölüm {b.boy}")
+        if imaj_boyu(imajlar[t]) != len(imajlar[t]):
+            hata(f"{b.ad}: yazılacak imajın başlığı boyuyla uyuşmuyor")
+    korunan = [b for b in bolumler.values() if b.aralik]
+    if korunan:
+        acik = araliklar_coz(oku(ARALIK_SYS).decode().strip())
+        kapali = [b.ad for b in korunan if not kapsar(acik, b.aralik)]
+        if kapali:
+            hata(f"çekirdeğin yazma aralığı {kapali} bölümlerini açmıyor: ilk kez fastboot ile "
+                 f"açılmalı (60-ufs-yazma.conf)")
+        if yeni_cmdline is not None:
+            yeni = araliklar_coz(kelime(yeni_cmdline, ARALIK))
+            kapali = [b.ad for b in korunan if not kapsar(yeni, b.aralik)]
+            if kapali:
+                hata(f"yeni komut satırının yazma aralığı {kapali} bölümlerini açmıyor: o "
+                     f"çekirdekle açılan sistem kendini bir daha güncelleyemezdi")
+    eski = {t: mevcut(b) for t, b in bolumler.items()}
+    if all(eski[t] == imajlar[t] for t in bolumler):
+        print(f"boot_{slot} ve vendor_boot_{slot} zaten bu imajlar, yazılmadı")
+        return False
+    if onceki_sakla:
+        d = os.path.join(cikti, "onceki")
+        os.makedirs(d, exist_ok=True)
+        for t in bolumler:
+            yaz(f"{d}/{t}-v3.img", eski[t])
+        yaz(f"{d}/SHA256SUMS", "".join(f"{hashlib.sha256(eski[t]).hexdigest()}  {t}-v3.img\n"
+                                     for t in bolumler).encode())
+        print(f"önceki imajlar: {d}")
+    for t, b in bolumler.items():
+        if eski[t] == imajlar[t]:
+            print(f"{b.ad}: aynı, yazılmadı")
+            continue
+        bolume_yaz(b, imajlar[t])
+        print(f"{b.ad}: {len(imajlar[t])} bayt yazıldı, cihazdan geri okundu, aynı")
+    return True
+
+
+def main():
+    a = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    a.add_argument("--cikti", help="default: <kurulum>/var/lib/nicole-imaj")
+    a.add_argument("--cmdline", help="boot-deploy'unki yerine (denemeler için)")
+    a.add_argument("--boot", help="/boot of the install (default: <kurulum>/boot)")
+    a.add_argument("--kurulum", default="/",
+                   help="another install mounted here (with its /boot), e.g. a new root being set up")
+    y = a.add_mutually_exclusive_group()
+    y.add_argument("--yaz", action="store_true",
+                   help="then write them to the running slot's boot_x and vendor_boot_x")
+    y.add_argument("--geri", action="store_true",
+                   help="write back what --yaz found on the partitions (DIR/onceki)")
+    a.add_argument("--slot", choices=["a", "b"], help=argparse.SUPPRESS)  # tests, with:
+    a.add_argument("--hedef-boot", help=argparse.SUPPRESS)
+    a.add_argument("--hedef-vendor-boot", help=argparse.SUPPRESS)
+    o = a.parse_args()
+    o.boot = o.boot or os.path.join(o.kurulum, "boot")
+    o.cikti = o.cikti or os.path.join(o.kurulum, "var/lib/nicole-imaj")
+    if o.cikti.startswith("/dev") or o.cikti.startswith("/sys"):
+        hata("yalnız dosya yazar")
+    hedefler = {k: v for k, v in (("boot", o.hedef_boot), ("vendor_boot", o.hedef_vendor_boot)) if v}
+    if (o.yaz or o.geri) and o.cmdline:
+        hata("--yaz ve --geri boot-deploy'un komut satırıyla çalışır")
+    if (o.slot or hedefler) and len(hedefler) != 2:
+        hata("--slot ile iki hedef dosya da verilmeli (yalnız denemeler)")
+    slot = (o.yaz or o.geri) and hedef_slot(o.kurulum, o.slot)
+
+    if o.geri:
+        d = os.path.join(o.cikti, "onceki")
+        imajlar = {t: oku(f"{d}/{t}-v3.img") for t in ("boot", "vendor_boot")}
+        beklenen = oku(f"{d}/SHA256SUMS").decode()
+        for t, v in imajlar.items():
+            if f"{hashlib.sha256(v).hexdigest()}  {t}-v3.img" not in beklenen:
+                hata(f"{d}/{t}-v3.img SHA256SUMS'a uymuyor")
+        bolumlere_yaz(o.cikti, imajlar, slot, hedefler, onceki_sakla=False,
+                      yeni_cmdline=imajlar["boot"][44:44 + 1536].rstrip(b"\0").decode())
+        return
+
+    cmdline = o.cmdline or deploy_cmdline(f"{o.boot}/boot.img")
+    cekirdek = oku(f"{o.boot}/vmlinuz")
+    ramdisk_yol = f"{o.boot}/initramfs"
+    ufs = ufs_acik_mi()
+    surum = denetle(cmdline, cekirdek, ramdisk_yol, ufs, o.kurulum)
+
+    with tempfile.TemporaryDirectory() as g:
+        dtb = dtb_hazirla(f"{o.boot}/dtbs/qcom/sm8350-razer-nicole.dtb", g, ufs)
+    boot = boot_v3(cekirdek, oku(ramdisk_yol), cmdline)
+    vendor = vendor_boot_v3(dtb)
+    if len(boot) > BOLUM_BOY or len(vendor) > BOLUM_BOY:
+        hata(f"bölüme sığmıyor: boot {len(boot)}, vendor_boot {len(vendor)}")
+
+    os.makedirs(o.cikti, exist_ok=True)
+    yaz(f"{o.cikti}/boot-v3.img", boot)
+    yaz(f"{o.cikti}/vendor_boot-v3.img", vendor)
+    ozet = "".join(f"{hashlib.sha256(v).hexdigest()}  {ad}\n"
+                   for ad, v in (("boot-v3.img", boot), ("vendor_boot-v3.img", vendor)))
+    yaz(f"{o.cikti}/SHA256SUMS", ozet.encode())
+    print(f"çekirdek {surum}, UFS {'açık' if ufs else 'kapalı'}")
+    print(f"cmdline: {cmdline}")
+    print(ozet, end="")
+    if o.yaz and bolumlere_yaz(o.cikti, {"boot": boot, "vendor_boot": vendor}, slot, hedefler,
+                               yeni_cmdline=cmdline):
+        print(f"yeni imaj slot {slot}'nın bir sonraki açılışında; açılmazsa her başlangıç bir "
+              f"deneme harcar, yedi denemeden sonra ABL kurtarma slotunu açar")
+
+
+if __name__ == "__main__":
+    main()

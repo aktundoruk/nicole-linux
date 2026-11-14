@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: CC0-1.0
+# SK Hynix Hi-556 (Razer Edge front camera)
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+  - Adjust:
+  - Agc:
+      # The soft ISP computes statistics every 4th frame, so AGC steps once
+      # per 4 frames (the 2-frame sensor delay fits inside that). The MSV
+      # error is at most 1.5 on the dark side, so the upstream defaults
+      # (0.04, 0.15) step 6% per 4 frames: >8 s from a short exposure to a
+      # dim room. 0.25 settled in 25-120 frames in a simulation of this
+      # loop without oscillating (0.2 dead band); measured on the device.
+      proportionalGain: 0.25
+      maxStep: 0.5
+...

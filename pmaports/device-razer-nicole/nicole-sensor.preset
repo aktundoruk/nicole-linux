@@ -1,0 +1,4 @@
+# Sensors are on the SLPI (sdsp); the ADSP sensor/root PDs are not used on nicole.
+enable hexagonrpcd-sdsp.service
+disable hexagonrpcd-adsp-sensorspd.service
+disable hexagonrpcd-adsp-rootpd.service

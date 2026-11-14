@@ -1,0 +1,29 @@
+<!doctype html><meta charset="utf-8"><title>Kamera sahnesi</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:Helvetica,Arial,sans-serif;cursor:none}
+#kart{display:none;position:absolute;inset:0;background:#7f7f7f}
+.grid{position:absolute;left:8%;top:12%;width:84%;height:56%;display:grid;grid-template-columns:repeat(6,1fr);gap:2%}
+.grid div{border-radius:2px}
+.yazi{position:absolute;left:8%;top:72%;font-size:9vh;font-weight:700;color:#000}
+.ok{position:absolute;right:8%;top:70%;font-size:16vh;color:#000}
+.ust{position:absolute;left:8%;top:2%;font-size:6vh;font-weight:700;color:#fff}
+</style>
+<div id="yon" style="display:none;position:absolute;inset:0;background:#fff;color:#000;font-weight:900;font-size:80vh;line-height:100vh;text-align:center">R<span style="color:#d00">↑</span></div>
+<div id="kart">
+ <div class="ust">ÜST</div>
+ <div class="grid" id="g"></div>
+ <div class="yazi">SOL ← R A Z E R</div>
+ <div class="ok">→</div>
+</div>
+<script>
+const renk=["#735244","#c29682","#627a9d","#576c43","#8580b1","#67bdaa",
+ "#d67e2c","#505ba6","#c15a63","#5e3c6c","#9dbc40","#e0a32e",
+ "#383d96","#469449","#af363c","#e7c71f","#bb5695","#0885a1",
+ "#f3f3f2","#c8c8c8","#a0a0a0","#7a7a79","#555555","#343434"];
+const g=document.getElementById("g");renk.forEach(c=>{const d=document.createElement("div");d.style.background=c;g.appendChild(d)});
+const k=document.getElementById("kart");let son="";
+async function bak(){try{const t=(await (await fetch("sahne.txt?"+Date.now())).text()).trim();
+ if(t!==son){son=t;const y=document.getElementById("yon");y.style.display=t==="yon"?"block":"none";if(t==="kart"){k.style.display="block";document.body.style.background="#7f7f7f"}else if(t==="yon"){k.style.display="none"}
+ else{k.style.display="none";document.body.style.background=t}}}catch(e){}setTimeout(bak,250)}
+bak();
+</script>

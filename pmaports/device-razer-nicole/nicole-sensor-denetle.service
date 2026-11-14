@@ -1,0 +1,11 @@
+[Unit]
+Description=Check that iio-sensor-proxy found the accelerometer (nicole-sensor-denetle)
+After=hexagonrpcd-sdsp.service
+
+[Service]
+# exec, not oneshot: the boot does not wait for the minute this may take
+Type=exec
+ExecStart=/usr/sbin/nicole-sensor-denetle
+
+[Install]
+WantedBy=multi-user.target

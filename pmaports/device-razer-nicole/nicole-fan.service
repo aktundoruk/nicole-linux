@@ -1,0 +1,15 @@
+[Unit]
+Description=Razer Edge (nicole) fan control (MAX31760, temperature driven)
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStartPre=-/sbin/modprobe max31760
+ExecStart=/bin/sh /usr/sbin/nicole-fan
+# fail safe: whatever ended the loop, leave the fan at full speed
+ExecStopPost=/bin/sh -c 'for d in /sys/class/hwmon/hwmon*; do [ "$(cat $d/name)" = max31760 ] && echo 255 > $d/pwm1; done; true'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

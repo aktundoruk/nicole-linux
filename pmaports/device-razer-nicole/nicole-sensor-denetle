@@ -1,0 +1,57 @@
+#!/bin/sh
+# nicole-sensor-denetle: after boot, make sure iio-sensor-proxy found the accelerometer.
+#
+# iio-sensor-proxy looks the SSC sensors up once, when it starts. If it starts while
+# hexagonrpcd-sdsp is still handing the SLPI its sensor registry, it gets light and
+# proximity but no accelerometer, and the screen never turns for the whole boot
+# (10 Kasım: HasAccelerometer false, both started in the same second; a restart found it).
+# This waits for hexagonrpcd-sdsp, then asks the proxy; while the accelerometer is missing
+# it restarts the proxy (a monitor-sensor client claims it again by itself).
+#
+# Test hooks: NICOLE_SENSOR_SORGU (command printing true/false), NICOLE_SENSOR_YENIDEN
+# (restart command), NICOLE_SENSOR_BEKLE (seconds between tries).
+BEKLE=${NICOLE_SENSOR_BEKLE:-15}
+DENEME=6
+
+sorgu() {
+	if [ -n "$NICOLE_SENSOR_SORGU" ]; then
+		sh -c "$NICOLE_SENSOR_SORGU"
+	else
+		busctl get-property net.hadess.SensorProxy /net/hadess/SensorProxy \
+			net.hadess.SensorProxy HasAccelerometer 2>/dev/null | awk '{print $2}'
+	fi
+}
+
+yeniden() {
+	if [ -n "$NICOLE_SENSOR_YENIDEN" ]; then
+		sh -c "$NICOLE_SENSOR_YENIDEN"
+	else
+		systemctl restart iio-sensor-proxy.service
+	fi
+}
+
+if [ -z "$NICOLE_SENSOR_SORGU" ]; then
+	i=0
+	until systemctl -q is-active hexagonrpcd-sdsp.service; do
+		i=$((i + 1))
+		[ $i -ge 60 ] && { echo "nicole-sensor-denetle: hexagonrpcd-sdsp çalışmıyor, denetim yok"; exit 1; }
+		sleep 2
+	done
+fi
+
+n=1
+while [ $n -le $DENEME ]; do
+	sleep "$BEKLE"
+	if [ "$(sorgu)" = true ]; then
+		[ $n -gt 1 ] && echo "nicole-sensor-denetle: ivmeölçer $n. denemede geldi"
+		[ $n -eq 1 ] && echo "nicole-sensor-denetle: ivmeölçer var"
+		exit 0
+	fi
+	echo "nicole-sensor-denetle: ivmeölçer yok ($n/$DENEME), iio-sensor-proxy yeniden başlatılıyor"
+	yeniden
+	n=$((n + 1))
+done
+sleep "$BEKLE"
+[ "$(sorgu)" = true ] && { echo "nicole-sensor-denetle: ivmeölçer son denemede geldi"; exit 0; }
+echo "nicole-sensor-denetle: ivmeölçer gelmedi, ekran kendiliğinden dönmeyecek"
+exit 1

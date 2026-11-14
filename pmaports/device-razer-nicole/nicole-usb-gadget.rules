@@ -1,0 +1,1 @@
+SUBSYSTEM=="udc", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="nicole-usb-gadget.service"

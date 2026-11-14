@@ -1,0 +1,30 @@
+# Add to drivers/input/touchscreen/Kconfig (alphabetical, near the other
+# FocalTech / EDT entries):
+
+config TOUCHSCREEN_FOCALTECH_FT3658S_SPI
+	tristate "FocalTech FT3658S SPI touchscreen"
+	depends on SPI_MASTER
+	select CRC_CCITT
+	help
+	  Say Y here if you have a FocalTech FT3658S touchscreen controller
+	  connected to your system via SPI, as found in the Razer Edge
+	  handheld.
+
+	  If unsure, say N.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called focaltech_ft3658s_spi.
+
+# Add to drivers/input/touchscreen/Makefile:
+#
+# obj-$(CONFIG_TOUCHSCREEN_FOCALTECH_FT3658S_SPI)	+= focaltech_ft3658s_spi.o
+#
+# Copy focaltech_ft3658s_spi.c to drivers/input/touchscreen/ and
+# focaltech,ft3658s.yaml to
+# Documentation/devicetree/bindings/input/touchscreen/.
+#
+# Config (nicole defconfig fragment):
+#   CONFIG_TOUCHSCREEN_FOCALTECH_FT3658S_SPI=m
+#   CONFIG_SPI_QCOM_GENI=y
+#   CONFIG_QCOM_GPI_DMA=y   (spi12 lists GPI DMA channels; geni falls back
+#                            to FIFO/SE DMA mode when GPI is not used)

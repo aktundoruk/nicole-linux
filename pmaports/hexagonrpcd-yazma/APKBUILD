@@ -1,0 +1,39 @@
+# hexagonrpcd with write support, for the Razer Edge's sensors (SLPI).
+#
+# The packaged hexagonrpcd (0.4.0) serves files to the DSPs read-only. The sm8350 sensor
+# framework writes its registry (sns_reg_version, registry/*) at first start and
+# crashes the SLPI when it cannot (sns_registry_sensor.c:154). This builds the open
+# upstream pull request that adds the write side:
+#   https://github.com/linux-msm/hexagonrpc/pull/27 (FadyAckad, sp11-sensors)
+# It installs beside the distro's hexagonrpcd, in /usr/lib/hexagonrpcd-yazma; the
+# device package points hexagonrpcd-sdsp.service at it. Drop this package once the
+# write support is merged and released.
+pkgname=hexagonrpcd-yazma
+_commit=40e50412812adce9dddc2be9a4510ebce05eef89
+pkgver=0.5.0_git20260921
+pkgrel=0
+pkgdesc="Qualcomm HexagonFS daemon with write support (upstream PR #27)"
+url="https://github.com/linux-msm/hexagonrpc/pull/27"
+arch="aarch64"
+license="GPL-3.0-or-later"
+makedepends="meson linux-headers"
+# !tracedeps: libhexagonrpc.so.0.5 lives beside the binary (LD_LIBRARY_PATH in the
+# device package's drop-in), outside the paths abuild resolves
+options="!check !tracedeps"
+depends="musl"
+source="hexagonrpc-$_commit.tar.gz::https://github.com/FadyAckad/hexagonrpc/archive/$_commit.tar.gz"
+builddir="$srcdir/hexagonrpc-$_commit"
+
+build() {
+	abuild-meson . output
+	meson compile -C output
+}
+
+package() {
+	install -Dm755 output/hexagonrpcd/hexagonrpcd "$pkgdir"/usr/lib/hexagonrpcd-yazma/hexagonrpcd
+	install -Dm755 output/libhexagonrpc/libhexagonrpc.so.0.5 \
+		"$pkgdir"/usr/lib/hexagonrpcd-yazma/libhexagonrpc.so.0.5
+}
+sha512sums="
+bba2c616fd6ca2dccf0e8046abc79da84419fca0f8cc911ec8eaff79a2d779b9aaec79be15705bd7d76232ba4ee9290da391f24a9ff9f718622f00c4b0eb956b  hexagonrpc-40e50412812adce9dddc2be9a4510ebce05eef89.tar.gz
+"

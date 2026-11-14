@@ -1,0 +1,25 @@
+From: Razer Edge port draft
+Subject: [PATCH] interconnect: qcom: sm8350: add the missing gem_noc -> config_noc PCIe link
+
+qns_pcie is the gem_noc slave that feeds config_noc's qnm_gemnoc_pcie, the
+master in front of xs_pcie_0/xs_pcie_1, but it has no link. Every
+"cpu-pcie" path (MASTER_APPSS_PROC -> SLAVE_PCIE_0) therefore fails with
+-EPROBE_DEFER ("of_icc_get_by_index: invalid path=-517") and a PCIe
+controller that describes its interconnects never probes. sm8450 and
+sc8280xp describe the same link.
+
+Found on the Razer Edge (SM8350) bringing up PCIe0 for the WCN6855 Wi-Fi.
+
+Fixes: d26a56674497 ("interconnect: qcom: Add SM8350 interconnect provider driver")
+---
+--- a/drivers/interconnect/qcom/sm8350.c	2026-10-29 01:09:21.842846768 +0300
++++ b/drivers/interconnect/qcom/sm8350.c	2026-10-29 01:09:21.843466807 +0300
+@@ -1131,6 +1131,8 @@
+ 	.name = "qns_pcie",
+ 	.channels = 1,
+ 	.buswidth = 8,
++	.num_links = 1,
++	.link_nodes = { &qnm_gemnoc_pcie },
+ };
+ 
+ static struct qcom_icc_node srvc_even_gemnoc = {
